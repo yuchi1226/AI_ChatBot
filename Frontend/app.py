@@ -3,65 +3,284 @@
 Frontend/app.py
 ----------------
 左右雙欄 AI 對話網站 (Gradio 實作，後端先用 fake_backend.py 假資料代替)
-
-左側 (scale=2)：gr.Chatbot，顯示歷史問答。
-    每則 AI 回覆下方固定顯示 📋複製 / 👍讚 / 👎踩 三個按鈕
-    -> 使用 Gradio 6 Chatbot 原生的 `buttons=["copy"]` +
-       `feedback_options=("Like","Dislike")`，穩定且不需要自行注入 DOM，
-       點擊會自動變色 (Gradio 內建動畫)，也提供 `.like()` / `.copy()`
-       事件掛勾，方便未來串接後端記錄回饋。
-
-右側 (scale=1)：gr.HTML，即時串流顯示對應的思考鏈，並自動捲動到底部
-    -> 用 MutationObserver 監看內容變化，隨串流自動 scrollTop = scrollHeight。
 """
 
 import html
 import gradio as gr
 
 try:
-    # 以 `python main.py` 執行時 (main.py 會把 Frontend 加進 sys.path)
     import fake_backend
 except ImportError:  # pragma: no cover
     from Frontend import fake_backend
 
 
 # ----------------------------------------------------------------------------
-# 樣式 (CSS)
+# 樣式 (CSS) - 經過重新設計與高度對齊
 # ----------------------------------------------------------------------------
 CUSTOM_CSS = """
-.gradio-container {max-width: 1400px !important; margin: auto;}
-
-#thought_panel {
-    height: 620px;
-    overflow: hidden;
-    border: 1px solid var(--border-color-primary);
-    border-radius: 12px;
-    background: var(--background-fill-secondary);
-    padding: 0;
+/* ================================================================
+   整體視覺
+   ================================================================ */
+.gradio-container {
+    max-width: 1440px !important;
+    width: min(1440px, calc(100vw - 40px)) !important;
+    margin: 0 auto !important;
+    padding: 28px 20px 36px !important;
+    box-sizing: border-box;
 }
+
+body {
+    background: var(--background-fill-primary);
+}
+
+#app_header {
+    margin: 0 0 18px 0;
+    padding: 4px 2px 0;
+}
+
+#app_title {
+    margin: 0 !important;
+    font-size: 28px !important;
+    line-height: 1.2 !important;
+    font-weight: 750 !important;
+    letter-spacing: -0.02em;
+}
+
+#app_subtitle {
+    margin-top: 7px !important;
+    color: var(--body-text-color-subdued) !important;
+    font-size: 14px !important;
+}
+
+/* ================================================================
+   主畫面：左右欄採固定 grid，比 scale 更穩定
+   左右欄永遠各自佔滿相同的整體高度
+   ================================================================ */
+#main_layout {
+    display: grid !important;
+    grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr) !important;
+    gap: 18px !important;
+    align-items: stretch !important;
+    height: 720px !important;
+    min-height: 720px !important;
+    margin: 0 !important;
+}
+
+#main_layout > .gr-column {
+    min-width: 0 !important;
+    width: auto !important;
+    height: 100% !important;
+    min-height: 0 !important;
+    display: flex !important;
+    flex-direction: column !important;
+}
+
+#left_panel,
+#right_panel {
+    min-width: 0 !important;
+    min-height: 0 !important;
+    height: 100% !important;
+    box-sizing: border-box !important;
+}
+
+#left_panel {
+    display: flex !important;
+    flex-direction: column !important;
+}
+
+#right_panel {
+    display: flex !important;
+    flex-direction: column !important;
+}
+
+/* ================================================================
+   聊天框：固定佔滿左欄剩餘高度，不被輸入區擠壓
+   ================================================================ */
+#chatbot_main {
+    flex: 1 1 auto !important;
+    min-height: 0 !important;
+    height: auto !important;
+    width: 100% !important;
+    border-radius: 16px !important;
+    border: 1px solid var(--border-color-primary) !important;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.055) !important;
+    overflow: hidden !important;
+    background: var(--background-fill-primary) !important;
+}
+
+#chatbot_main .message {
+    line-height: 1.7 !important;
+}
+
+/* ================================================================
+   右側思考區：直接填滿整個右欄，因此與左欄總高度一致
+   ================================================================ */
+#thought_panel {
+    flex: 1 1 auto !important;
+    min-height: 0 !important;
+    height: 100% !important;
+    width: 100% !important;
+    overflow: hidden !important;
+    box-sizing: border-box !important;
+    border: 1px solid var(--border-color-primary) !important;
+    border-radius: 16px !important;
+    background: var(--background-fill-secondary) !important;
+    padding: 0 !important;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.045) !important;
+}
+
 .thought-scroll-inner {
+    width: 100%;
     height: 100%;
     overflow-y: auto;
-    padding: 16px;
+    overflow-x: hidden;
+    padding: 22px;
     box-sizing: border-box;
     font-size: 14px;
-    line-height: 1.7;
+    line-height: 1.75;
+    font-family: 'Cascadia Mono', 'SFMono-Regular', Consolas, monospace;
+    white-space: normal;
+    word-break: break-word;
 }
+
 .thought-empty {
     color: var(--body-text-color-subdued);
     font-style: italic;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+    height: 100%;
+    padding: 24px;
+    box-sizing: border-box;
 }
 
-#chatbot_main {height: 560px;}
+/* ================================================================
+   輸入區：固定在左欄底部，不改變左欄寬度
+   ================================================================ */
+.input-group {
+    flex: 0 0 auto !important;
+    width: 100% !important;
+    box-sizing: border-box !important;
+    margin-top: 14px !important;
+    padding: 5px !important;
+    border-radius: 14px !important;
+    border: 1px solid var(--border-color-primary) !important;
+    background: var(--background-fill-primary) !important;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.05) !important;
+}
 
-#example-row {margin-top: 4px;}
-#example-row button {white-space: normal;}
+.input-group > .gr-row {
+    width: 100% !important;
+    margin: 0 !important;
+}
+
+.input-group textarea,
+.input-group textarea:focus {
+    border: none !important;
+    box-shadow: none !important;
+    min-height: 48px !important;
+}
+
+#send_btn {
+    min-width: 52px !important;
+    height: 48px !important;
+    border: 0 !important;
+    border-radius: 10px !important;
+    background: var(--primary-600) !important;
+    color: white !important;
+    font-size: 20px !important;
+    font-weight: 700 !important;
+    transition: transform .15s ease, filter .15s ease, opacity .15s ease;
+}
+
+#send_btn:hover {
+    filter: brightness(0.96);
+    transform: translateY(-1px);
+}
+
+#send_btn:active {
+    transform: translateY(0);
+}
+
+/* ================================================================
+   範例問題：寬度由 grid 決定，按鈕不會把欄位撐變形
+   ================================================================ */
+#example-row {
+    flex: 0 0 auto !important;
+    width: 100% !important;
+    margin-top: 12px !important;
+    display: grid !important;
+    grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+    gap: 8px !important;
+}
+
+#example-row button {
+    width: 100% !important;
+    min-width: 0 !important;
+    min-height: 42px !important;
+    white-space: normal !important;
+    overflow-wrap: anywhere !important;
+    border-radius: 12px !important;
+    padding: 7px 12px !important;
+    border: 1px solid var(--border-color-primary) !important;
+    background: var(--background-fill-secondary) !important;
+    transition: all .15s ease;
+}
+
+#example-row button:hover {
+    border-color: var(--primary-500) !important;
+    transform: translateY(-1px);
+}
+
+/* ================================================================
+   第二個 Tab：說明內容
+   ================================================================ */
+#about_panel {
+    max-width: 1000px;
+    margin: 0 auto;
+}
+
+/* ================================================================
+   RWD：窄螢幕改成上下排列，避免左右欄被壓縮變形
+   ================================================================ */
+@media (max-width: 900px) {
+    .gradio-container {
+        width: min(100vw - 24px, 720px) !important;
+        padding: 20px 12px 28px !important;
+    }
+
+    #main_layout {
+        grid-template-columns: 1fr !important;
+        height: auto !important;
+        min-height: 0 !important;
+    }
+
+    #left_panel,
+    #right_panel {
+        height: auto !important;
+        min-height: 0 !important;
+    }
+
+    #chatbot_main {
+        height: 560px !important;
+        flex: none !important;
+    }
+
+    #thought_panel {
+        height: 420px !important;
+        min-height: 420px !important;
+        flex: none !important;
+    }
+
+    #example-row {
+        grid-template-columns: 1fr !important;
+    }
+}
 """
 
-
 # ----------------------------------------------------------------------------
-# 前端 JavaScript：讓右側思考鏈區塊在內容更新時自動捲動到最底部
-# 透過 launch(head=...) 注入到 <head>
+# 前端 JavaScript
 # ----------------------------------------------------------------------------
 HEAD_JS = """
 <script>
@@ -89,24 +308,18 @@ HEAD_JS = """
 </script>
 """
 
-
 # ----------------------------------------------------------------------------
 # Helper
 # ----------------------------------------------------------------------------
 def render_thought_html(thought_text: str) -> str:
     if not thought_text:
-        inner = '<span class="thought-empty">尚無思考內容…</span>'
+        inner = '<span class="thought-empty">等待思考過程…</span>'
     else:
         inner = html.escape(thought_text).replace("\n", "<br>")
     return f'<div class="thought-scroll-inner">{inner}</div>'
 
-
 def _extract_text(content) -> str:
-    """Chatbot 訊息的 content 送到後端事件時，可能是純字串，
-    也可能被 Gradio 轉成 [{'type': 'text', 'text': '...'}] 這種多模態格式，
-    這裡統一轉成純文字，避免 .lower() / f-string 等操作出錯。"""
-    if isinstance(content, str):
-        return content
+    if isinstance(content, str): return content
     if isinstance(content, list):
         parts = []
         for item in content:
@@ -117,35 +330,30 @@ def _extract_text(content) -> str:
         return "".join(parts)
     return "" if content is None else str(content)
 
-
 EXAMPLE_QUESTIONS = [
     "今天天氣如何？適合出門嗎？",
     "可以簡單介紹一下 Gradio 嗎？",
     "為什麼很多 AI 工具都用 Python 開發？",
 ]
 
-
 # ----------------------------------------------------------------------------
 # 對話邏輯
 # ----------------------------------------------------------------------------
 def user_submit(user_message, history):
-    """使用者送出訊息：立刻顯示在左側對話區，並清空輸入框、右側思考區"""
     user_message = (user_message or "").strip()
     if not user_message:
         return history, "", render_thought_html("")
-
     history = history + [{"role": "user", "content": user_message}]
     return history, "", render_thought_html("")
 
-
-def disable_input():
-    return gr.update(interactive=False)
-
+def disable_inputs():
+    """同時停用輸入框與發送按鈕"""
+    return gr.update(interactive=False), gr.update(interactive=False)
 
 def bot_response(history):
-    """依據最後一則使用者訊息，串流產生思考鏈 (右) + 最終回覆 (左)"""
     if not history or history[-1]["role"] != "user":
-        yield history, render_thought_html(""), gr.update(interactive=True)
+        # 如果無效，立刻重新啟用輸入元件
+        yield history, render_thought_html(""), gr.update(interactive=True), gr.update(interactive=True)
         return
 
     user_message = _extract_text(history[-1]["content"])
@@ -157,86 +365,124 @@ def bot_response(history):
     for event, data in fake_backend.stream_answer(user_message):
         if event == "thought_chunk":
             thought_acc += data
-            yield history, render_thought_html(thought_acc), gr.update(interactive=False)
+            # 串流中保持停用狀態
+            yield history, render_thought_html(thought_acc), gr.update(interactive=False), gr.update(interactive=False)
 
         elif event == "response_chunk":
             response_acc += data
             history[-1]["content"] = response_acc
-            yield history, render_thought_html(thought_acc), gr.update(interactive=False)
+            yield history, render_thought_html(thought_acc), gr.update(interactive=False), gr.update(interactive=False)
 
         elif event == "end":
             history[-1]["content"] = response_acc
-            # 串流結束 -> 重新啟用輸入框；此時 Gradio 會在該則訊息下方
-            # 顯示 📋複製 / 👍 / 👎 按鈕 (buttons / feedback_options 設定)
-            yield history, render_thought_html(thought_acc), gr.update(interactive=True)
-
+            # 串流結束，重新啟用輸入框與發送按鈕
+            yield history, render_thought_html(thought_acc), gr.update(interactive=True), gr.update(interactive=True)
 
 def on_like(data: gr.LikeData):
-    """使用者點擊 👍 / 👎 時觸發 (Gradio 內建按鈕已自動處理變色動畫)。
-    這裡先用 print 模擬記錄，之後可換成呼叫真正後端 API。"""
     feedback = "讚" if data.liked else "踩"
     print(f"[feedback] index={data.index} value={feedback} message={data.value!r}")
 
-
 def on_copy(data: gr.CopyData):
-    """使用者點擊 📋 複製按鈕時觸發（複製到剪貼簿已由 Gradio 前端內建處理）"""
     print(f"[copy] value={data.value!r}")
-
 
 # ----------------------------------------------------------------------------
 # 建立 Gradio Blocks
 # ----------------------------------------------------------------------------
 def build_demo() -> gr.Blocks:
-    with gr.Blocks(title="AI 雙欄對話 Demo") as demo:
-        gr.Markdown("## 🤖 AI 對話助手（左：對話紀錄　右：思考鏈，後端目前為假資料）")
+    with gr.Blocks(title="AI 助手 2.0") as demo:
+        # ================================================================
+        # 主要對話頁
+        # ================================================================
+        with gr.Tab(label="AI 對話"):
+            with gr.Column(elem_id="app_header"):
+                gr.Markdown("# AI 助手 2.0", elem_id="app_title")
+                gr.Markdown("智慧對話、思考過程與回覆集中在同一個工作區。", elem_id="app_subtitle")
 
-        with gr.Row():
-            # ---------------- 左側：對話區 scale=2 (~66%) ----------------
-            with gr.Column(scale=2):
-                chatbot = gr.Chatbot(
-                    elem_id="chatbot_main",
-                    label="對話紀錄",
-                    height=560,
-                    buttons=["copy"],                       # 每則訊息下方顯示 📋 複製
-                    feedback_options=("Like", "Dislike"),    # 每則 AI 訊息顯示 👍 / 👎
-                    like_user_message=False,
+            with gr.Row(elem_id="main_layout"):
+                # ---------------- 左側：固定 2/3 寬度 ----------------
+                with gr.Column(elem_id="left_panel", scale=2, min_width=0):
+                    chatbot = gr.Chatbot(
+                        elem_id="chatbot_main",
+                        buttons=["copy"],
+                        feedback_options=("Like", "Dislike"),
+                        like_user_message=False,
+                    )
+
+                    with gr.Group(elem_classes="input-group"):
+                        with gr.Row():
+                            msg_box = gr.Textbox(
+                                placeholder="輸入訊息後按 Enter 或點擊發送…",
+                                show_label=False,
+                                autofocus=True,
+                                container=False,
+                                scale=8,
+                            )
+                            send_btn = gr.Button(
+                                value="➤",
+                                elem_id="send_btn",
+                                scale=1,
+                                min_width=52,
+                            )
+
+                    with gr.Row(elem_id="example-row"):
+                        example_btns = [
+                            gr.Button(q, size="sm") for q in EXAMPLE_QUESTIONS
+                        ]
+
+                # ---------------- 右側：固定 1/3 寬度 ----------------
+                with gr.Column(elem_id="right_panel", scale=1, min_width=0):
+                    thought_html = gr.HTML(
+                        value=render_thought_html(""),
+                        elem_id="thought_panel",
+                    )
+
+        # ================================================================
+        # 說明頁
+        # ================================================================
+        with gr.Tab(label="使用說明"):
+            with gr.Column(elem_id="about_panel"):
+                gr.Markdown(
+                    """# AI 助手 2.0
+
+"
+                    "- 使用者可以透過輸入框與 AI 互動。
+"
+                    "- AI 回覆會即時串流顯示。
+"
+                    "- 右側面板用於顯示思考過程。
+"
+                    "- 可直接按 Enter 或點擊發送按鈕送出訊息。
+"
+                    "- 下方提供常用問題範例，可快速開始對話。"""
                 )
 
-                msg_box = gr.Textbox(
-                    placeholder="輸入訊息後按 Enter 送出…",
-                    show_label=False,
-                    autofocus=True,
-                )
-
-                with gr.Row(elem_id="example-row"):
-                    example_btns = [
-                        gr.Button(q, size="sm", variant="secondary")
-                        for q in EXAMPLE_QUESTIONS
-                    ]
-
-            # ---------------- 右側：思考鏈區 scale=1 (~34%) ----------------
-            with gr.Column(scale=1):
-                gr.Markdown("### 🧠 思考鏈 (Chain of Thought)")
-                thought_html = gr.HTML(
-                    value=render_thought_html(""),
-                    elem_id="thought_panel",
-                )
-
-        # ---------------- 事件綁定 ----------------
-        # 1) 使用者送出訊息 -> 立即顯示於左側 + 清空思考區
-        # 2) 停用輸入框，避免串流過程中重複送出
-        # 3) 呼叫 bot_response 逐字串流輸出思考鏈 + 最終回覆，結束後重新啟用輸入框
+        # ================================================================
+        # 事件綁定
+        # ================================================================
         msg_box.submit(
             fn=user_submit,
             inputs=[msg_box, chatbot],
             outputs=[chatbot, msg_box, thought_html],
         ).then(
-            fn=disable_input,
-            outputs=[msg_box],
+            fn=disable_inputs,
+            outputs=[msg_box, send_btn],
         ).then(
             fn=bot_response,
             inputs=[chatbot],
-            outputs=[chatbot, thought_html, msg_box],
+            outputs=[chatbot, thought_html, msg_box, send_btn],
+        )
+
+        send_btn.click(
+            fn=user_submit,
+            inputs=[msg_box, chatbot],
+            outputs=[chatbot, msg_box, thought_html],
+        ).then(
+            fn=disable_inputs,
+            outputs=[msg_box, send_btn],
+        ).then(
+            fn=bot_response,
+            inputs=[chatbot],
+            outputs=[chatbot, thought_html, msg_box, send_btn],
         )
 
         for btn, q in zip(example_btns, EXAMPLE_QUESTIONS):
@@ -248,20 +494,18 @@ def build_demo() -> gr.Blocks:
                 inputs=[msg_box, chatbot],
                 outputs=[chatbot, msg_box, thought_html],
             ).then(
-                fn=disable_input,
-                outputs=[msg_box],
+                fn=disable_inputs,
+                outputs=[msg_box, send_btn],
             ).then(
                 fn=bot_response,
                 inputs=[chatbot],
-                outputs=[chatbot, thought_html, msg_box],
+                outputs=[chatbot, thought_html, msg_box, send_btn],
             )
 
-        # 按鈕點擊回饋（讚 / 踩 / 複製）事件掛勾，未來可接後端 API 記錄
         chatbot.like(on_like, inputs=None, outputs=None)
         chatbot.copy(on_copy, inputs=None, outputs=None)
 
     return demo
-
 
 demo = build_demo()
 
