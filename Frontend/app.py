@@ -389,13 +389,13 @@ def on_copy(data: gr.CopyData):
 # 建立 Gradio Blocks
 # ----------------------------------------------------------------------------
 def build_demo() -> gr.Blocks:
-    with gr.Blocks(title="AI 助手 2.0") as demo:
+    with gr.Blocks(title="127.0.0.1:7860") as demo:
         # ================================================================
         # 主要對話頁
         # ================================================================
-        with gr.Tab(label="AI 對話"):
+        with gr.Tab(label="對話"):
             with gr.Column(elem_id="app_header"):
-                gr.Markdown("# AI 助手 2.0", elem_id="app_title")
+                gr.Markdown("# AI 助手", elem_id="app_title")
                 gr.Markdown("智慧對話、思考過程與回覆集中在同一個工作區。", elem_id="app_subtitle")
 
             with gr.Row(elem_id="main_layout"):
@@ -439,7 +439,7 @@ def build_demo() -> gr.Blocks:
         # ================================================================
         # 說明頁
         # ================================================================
-        with gr.Tab(label="使用說明"):
+        with gr.Tab(label="軌跡"):
             with gr.Column(elem_id="about_panel"):
                 gr.Markdown(
                     """# AI 助手 2.0
