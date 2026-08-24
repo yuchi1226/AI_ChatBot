@@ -70,16 +70,23 @@ body {
     align-items: stretch !important;
     height: 720px !important;
     min-height: 720px !important;
+    max-height: 720px !important;
     margin: 0 !important;
+    /* 保護整體版面：不管內層（聊天訊息／思考內容）長出什麼奇怪的寬高，
+       都不允許撐破這個 720px 的格線容器，避免把輸入框、範例按鈕擠到
+       別的欄位去。內層真正需要捲動的地方各自有自己的 overflow-y:auto。 */
+    overflow: hidden !important;
 }
 
 #main_layout > .gr-column {
     min-width: 0 !important;
     width: auto !important;
     height: 100% !important;
+    max-height: 100% !important;
     min-height: 0 !important;
     display: flex !important;
     flex-direction: column !important;
+    overflow: hidden !important;
 }
 
 #left_panel,
@@ -87,7 +94,24 @@ body {
     min-width: 0 !important;
     min-height: 0 !important;
     height: 100% !important;
+    max-height: 100% !important;
     box-sizing: border-box !important;
+    /* 真正的破圖成因：Gradio 的 Column 元件（.column class）本身預設
+       flex-wrap 是 wrap。平常這是為了讓 Column 在螢幕太窄時能自動換行，
+       但這裡是 flex-direction:column，wrap 的方向是「換到旁邊那一欄」
+       （cross axis 是水平的）。當第一個子元素（聊天框）回答完後，內容
+       實際需要的高度超過欄位可用的 720px，瀏覽器在做 wrap 判斷時，會先
+       用「還沒套用 flex-shrink 之前」的原始內容高度去判斷要不要換行，
+       發現放不下就把聊天框自己獨立算成第一欄，接著把輸入框、範例問題
+       按鈕擠成「第二欄」，畫面上就變成疊在思考欄前面、被推到右邊。
+       用 flex-wrap: nowrap 強制鎖成單一欄，聊天框才會真的被同一欄裡的
+       輸入框、範例問題按鈕擠壓、乖乖用 min-height:0 縮小，而不是整個
+       跑去開新的一欄。 */
+    flex-wrap: nowrap !important;
+    /* 同上：左／右欄本身也要裁切，這樣即使 gr.Chatbot 內部元件的高度／
+       寬度計算跑掉，也只會被裁掉多出來的部分，不會把同一欄後面的
+       輸入框、範例問題按鈕，或旁邊的思考欄推擠變形。 */
+    overflow: hidden !important;
 }
 
 #left_panel {
@@ -105,9 +129,16 @@ body {
    ================================================================ */
 #chatbot_main {
     flex: 1 1 auto !important;
+    min-width: 0 !important;
     min-height: 0 !important;
-    height: auto !important;
+    height: 100% !important;
+    max-height: 100% !important;
     width: 100% !important;
+    max-width: 100% !important;
+    /* Gradio Chatbot 內部用 position:absolute 的包裹層把訊息區塊撐滿父層，
+       這裡明確給 position:relative 當作那層 absolute 的定位基準，避免它
+       找不到夠近的定位祖先、跑去撐滿更外層的容器，把版面撐壞。 */
+    position: relative !important;
     border-radius: 16px !important;
     border: 1px solid var(--border-color-primary) !important;
     box-shadow: 0 8px 28px rgba(0, 0, 0, 0.055) !important;
@@ -115,8 +146,44 @@ body {
     background: var(--background-fill-primary) !important;
 }
 
+/* Gradio Chatbot 內部的訊息捲動容器（.panel-wrap / .bubble-wrap）：明確
+   鎖死高度並交出捲動權，不讓訊息（尤其是回答完後突然變長的那一則）把
+   #chatbot_main 的外框撐大，進而擠壓同一欄的輸入框／範例問題按鈕，或
+   把版面推到右側思考欄去。 */
+#chatbot_main > div,
+#chatbot_main .wrap,
+#chatbot_main .panel-wrap,
+#chatbot_main .bubble-wrap {
+    min-width: 0 !important;
+    min-height: 0 !important;
+    max-width: 100% !important;
+    height: 100% !important;
+    max-height: 100% !important;
+}
+
+#chatbot_main .panel-wrap,
+#chatbot_main .bubble-wrap {
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+}
+
 #chatbot_main .message {
     line-height: 1.7 !important;
+}
+
+/* 訊息內文若出現一長串不會換行的文字（網址、程式碼、hash 等），也不能
+   撐開整欄的寬度，一律強制換行並限制在欄寬內。 */
+#chatbot_main .message-wrap,
+#chatbot_main .message,
+#chatbot_main pre,
+#chatbot_main code {
+    min-width: 0 !important;
+    max-width: 100% !important;
+    overflow-wrap: anywhere !important;
+}
+
+#chatbot_main pre {
+    overflow-x: auto !important;
 }
 
 /* ================================================================
@@ -137,10 +204,17 @@ body {
 }
 
 .thought-scroll-inner {
+    /* 這裡故意不設 overflow-y:auto——真正負責捲動的是 Gradio HTML 元件
+       自己的 .html-container（由 gr.HTML(min_height="100%", max_height=
+       "100%", autoscroll=True) 這幾個參數驅動，見下方 build_demo()）。
+       這一層維持 height:100%（讓 .thought-empty 的置中效果在內容還很短
+       時仍然生效），內容一旦變長，會自然撐出這個 100% 的框，交給外層
+       .html-container 的 overflow-y:auto 去捲動——Gradio 內建的
+       autoscroll 邏輯也是往上找「最近一個 overflow:auto/scroll 的祖先」
+       來捲動，如果這裡自己開一個獨立的捲動區，Gradio 反而會找不到真正
+       在捲動的地方，導致捲不動或抓不到底部。 */
     width: 100%;
     height: 100%;
-    overflow-y: auto;
-    overflow-x: hidden;
     padding: 22px;
     box-sizing: border-box;
     font-size: 14px;
@@ -148,6 +222,7 @@ body {
     font-family: 'Cascadia Mono', 'SFMono-Regular', Consolas, monospace;
     white-space: normal;
     word-break: break-word;
+    overflow-wrap: anywhere;
 }
 
 .thought-empty {
@@ -289,31 +364,17 @@ body {
 # ----------------------------------------------------------------------------
 # 前端 JavaScript
 # ----------------------------------------------------------------------------
-HEAD_JS = """
-<script>
-(function watchThoughtPanel() {
-    const trySetup = () => {
-        const panel = document.getElementById('thought_panel');
-        if (!panel) {
-            setTimeout(trySetup, 300);
-            return;
-        }
-        const scrollToBottom = () => {
-            const inner = panel.querySelector('.thought-scroll-inner');
-            if (inner) inner.scrollTop = inner.scrollHeight;
-        };
-        const observer = new MutationObserver(scrollToBottom);
-        observer.observe(panel, {childList: true, subtree: true, characterData: true});
-        scrollToBottom();
-    };
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', trySetup);
-    } else {
-        trySetup();
-    }
-})();
-</script>
-"""
+# 原本這裡自己刻了一套 MutationObserver 去監控 #thought_panel、手動記錄
+# 捲動位置、模擬「黏底」效果。拆掉的原因：實際測試發現完全不會動、
+# 也滑不動——追下去才發現 Gradio 的 gr.HTML 元件本身就有 autoscroll 參數
+# （見 build_demo() 裡 thought_html = gr.HTML(...) 那段），而且 Gradio
+# 自己的實作方式是「往上找最近一個 overflow:auto/scroll 的祖先」來捲動；
+# 我們之前塞給 .thought-scroll-inner 的 overflow-y:auto 反而讓真正在捲動
+# 的地方變成一個 Gradio 找不到的內層節點，導致內建的 autoscroll 抓不到、
+# 我們自己刻的那套也因為節點被整個置換而亂掉——兩套邏輯互相打架。
+# 現在直接交給 Gradio 內建機制處理，不需要任何自訂 JS，也不用維護一份
+# 容易在節點置換時出錯的手刻捲動邏輯。
+HEAD_JS = ""
 
 # ----------------------------------------------------------------------------
 # Helper
@@ -463,6 +524,16 @@ def build_demo() -> gr.Blocks:
                     thought_html = gr.HTML(
                         value=render_thought_html(""),
                         elem_id="thought_panel",
+                        # 鎖死高度 = 一律填滿 #thought_panel（見 CUSTOM_CSS），
+                        # 內容變長時交給 Gradio 自己的 overflow-y:auto 捲動；
+                        # autoscroll=True 是 Gradio HTML 元件內建的「黏底」
+                        # 行為：內容更新時若使用者本來就在底部附近，自動捲到
+                        # 新內容；若使用者已經手動往上滑，就不會被拉回去。
+                        # 這樣就不用自己刻一套 MutationObserver + 記錄捲動
+                        # 位置的邏輯（原本刻的那套已經移除，見 HEAD_JS 說明）。
+                        min_height="100%",
+                        max_height="100%",
+                        autoscroll=True,
                     )
 
         # ================================================================
