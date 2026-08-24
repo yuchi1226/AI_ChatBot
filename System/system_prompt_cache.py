@@ -24,6 +24,13 @@ System/system_prompt_cache.py
 裡的常數，沒有外部來源會變動，套用 TTL 只是在測一個沒有東西可以失效的
 空邏輯。等未來真的接上外部設定中心／CDN 時，再於這一層加上失效判斷即可，
 呼叫端介面不需要改變。
+
+`default` 範本的 `tool_definitions` 改為引用 Tool.get_tool_definitions()
+（Architect/ToolCalling.md §3 定義的六個工具白名單），不再寫死空陣列；
+`_validate_tool_definitions()` 這道 §5 降級檢查因此開始真正發揮作用
+（Tool/catalog.py 若未來改壞格式，這裡仍會攔下來退回無工具模式）。
+`FALLBACK_PROMPT_BLOCK` 刻意維持空陣列：Fallback 語意本來就是「僅基本
+助理角色，不含任何工具」（見下方 FALLBACK_PROMPT_BLOCK 的註解）。
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ import logging
 from typing import Any, Dict, List
 
 from Harness.errors import PromptFetchFailed
+from Tool import get_tool_definitions
 
 PromptTemplate = Dict[str, Any]
 
@@ -55,10 +63,12 @@ _PROMPTS: Dict[str, PromptTemplate] = {
         "mode": "default",
         "content": {
             "role_definition": (
-                "你是一位專業、誠實且樂於助人的 AI 助理，會根據使用者的問題提供"
-                "清楚、有條理的回答。目前日期：{{current_date}}。"
+                "你是一位專業、誠實且樂於助人的 AI 助理，預設用繁體中文思考和回答。"
+                "目前日期：{{current_date}}。"
             ),
-            "tool_definitions": [],
+            # Architect/ToolCalling.md §3：六個工具的白名單，唯一資料來源是
+            # Tool/catalog.py，這裡不重複寫死工具清單。
+            "tool_definitions": get_tool_definitions(),
             "safety_guardrails": (
                 "禁止提供暴力、非法或有害內容；不得執行違反使用者隱私或安全政策之請求；"
                 "對不確定的資訊須誠實告知，不可捏造事實。"

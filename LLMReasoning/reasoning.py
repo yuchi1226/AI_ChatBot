@@ -2,7 +2,8 @@
 """
 LLMReasoning/reasoning.py
 ----------------------------
-核心協調流程，對應 Architect/LLMReasoning.md §3.1–3.3、§4：
+核心協調流程，對應 Architect/LLMReasoning.md §3.1–3.3、§4，並整合
+Architect/ToolCalling.md §5、§6：
 
   3.1 組裝完整 Prompt      -> 已由 Harness.handle_turn() 完成，本模組直接
                               收現成的 request_payload，不重複組裝。
@@ -12,13 +13,19 @@ LLMReasoning/reasoning.py
   3.3 判斷是否呼叫工具      -> decide_action()（見 actions.py）。
   §4 後續流轉：
     無需呼叫工具 -> content 即最終回覆，寫回 Session 歷史，結束。
-    需要呼叫工具 -> 先驗證 tool_calls 格式（§5 格式錯誤 -> 立即回錯誤提示，
-                    不進入暫存流程）；格式合法則把 reason_content／
-                    tool_calls 暫存進 Session（供 Tool/、Guardrails/ 套件
-                    完工後，由 resume_with_tool_result() 接手做第二輪
-                    推理）。因為 Tool/、Guardrails/ 目前尚未實作，本輪
-                    立即以降級文字答覆，並清空暫存狀態（這一輪不會再有人
-                    來 resume 它）。
+    需要呼叫工具 -> 依序做兩層檢查：
+      ① §5 結構檢查（LLMReasoning.actions.validate_tool_calls）：這段 JSON
+        本身合不合法（function.name 是否存在、arguments 是否為合法 JSON）。
+        不合法 -> 模型連格式都吐不出來，重試也修不好，立即回錯誤提示。
+      ② ToolCalling.md §6 白名單/型態檢查（Tool.validate_against_catalog）：
+        名稱在不在 Tool/catalog.py 的白名單內、必填參數齊不齊全、型態對不
+        對。不合法 -> 觸發 §6 規定的重試機制：在 messages 尾端附加修正提示，
+        要求模型重新生成 tool_calls，最多 Tool.RETRY_MAX（2）次；重試次數
+        用盡仍不合法，才回錯誤提示。
+    兩層檢查都通過後，把 reason_content／tool_calls 暫存進 Session（供
+    Guardrails/ 與真正的工具執行管道完工後，由 resume_with_tool_result()
+    接手做第二輪推理）。因為那條執行管道目前尚未實作，本輪立即以降級文字
+    答覆，並清空暫存狀態（這一輪不會再有人來 resume 它）。
 """
 
 from __future__ import annotations
@@ -28,6 +35,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import Harness
 import LLM
+import Tool
 from Harness.text_preprocessing import approx_token_count
 from LLMReasoning.actions import Action, decide_action, validate_tool_calls
 from LLMReasoning.config import MAX_REASONING_TOKENS, REASONING_TOKEN_WARN_RATIO
@@ -64,9 +72,11 @@ def _log_reasoning_token_usage(reason_content: str) -> None:
 
 def _tool_pipeline_unavailable_notice(tool_calls: List[Dict[str, Any]]) -> str:
     """
-    Tool/、Guardrails/ 套件尚未實作時的降級行為：模型想呼叫工具，但目前沒有
-    工具執行管線可以接手處理，於是記錄警告並回傳一段對使用者誠實的說明
-    文字，而不是靜默吞掉、留一顆永遠空白的回覆泡泡給使用者。
+    工具執行管道（Guardrails/ 的安全審查、以及真正呼叫各工具的 Tool Pipeline）
+    尚未實作時的降級行為：模型想呼叫工具、且 Tool.validate_against_catalog()
+    也已確認這是白名單內、格式合法的呼叫，但目前沒有執行管道可以接手處理，
+    於是記錄警告並回傳一段對使用者誠實的說明文字，而不是靜默吞掉、留一顆
+    永遠空白的回覆泡泡給使用者。
 
     （這段邏輯原本在 LLM/llm.py；搬來這裡是因為「要不要呼叫工具管線」屬於
     決策，不屬於「跟模型溝通」——見 LLM/ 與 LLMReasoning/ 的職責劃分。）
@@ -75,7 +85,9 @@ def _tool_pipeline_unavailable_notice(tool_calls: List[Dict[str, Any]]) -> str:
         call.get("function", {}).get("name", "unknown") for call in tool_calls
     ) or "unknown"
     logger.warning(
-        "模型要求呼叫工具（%s），但 Tool/Guardrails 管線尚未實作，略過執行。", names
+        "模型要求呼叫工具（%s），已通過白名單驗證，但工具執行管道（Guardrails/）"
+        "尚未實作，略過執行。",
+        names,
     )
     return f"（這個問題可能需要使用工具「{names}」協助回答，但工具執行功能尚未上線，暫時無法提供。）"
 
@@ -103,9 +115,33 @@ def _clear_pending_reasoning(session_id: str) -> None:
     session.touch()
 
 
+def _append_retry_notice(request_payload: Dict[str, Any], exc: Exception) -> Dict[str, Any]:
+    """
+    ToolCalling.md §6：重試前，在 messages 尾端附加一則修正提示，告訴模型
+    上一次的 tool_calls 哪裡不合法，要求重新生成。
+
+    只回傳一份新的 request_payload（複製一份新的 messages 陣列），不修改
+    呼叫端傳入的原始物件，也不寫回 Session 歷史——重試是這一輪同步發生的
+    事，不需要留存到下一輪對話裡。
+    """
+    messages = list(request_payload.get("messages", []))
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                f"你上一次產生的工具呼叫不合法：{exc}。"
+                "請重新產生正確的 tool_calls（工具名稱需在系統提示詞的工具清單內，"
+                "且包含所有必填參數）。"
+            ),
+        }
+    )
+    return {**request_payload, "messages": messages}
+
+
 def process(session_id: str, request_payload: Dict[str, Any]) -> Iterator[Event]:
     """
-    對應 §3.2–3.3 + §4：呼叫 LLM、判定動作、流轉到對應分支。
+    對應 §3.2–3.3 + §4，並整合 ToolCalling.md §6 的重試機制：呼叫 LLM、判定
+    動作、視需要重試、流轉到對應分支。
 
     Args:
         session_id: Harness.handle_turn() 回傳的（已解析）Session ID。
@@ -118,58 +154,99 @@ def process(session_id: str, request_payload: Dict[str, Any]) -> Iterator[Event]
             ("response_chunk", <最終回覆片段>)
             ("end",             None)
         （LLM.stream_answer() 額外送出的 "tool_calls" 事件會在這裡被消化，
-        不會轉發給呼叫端。）
+        不會轉發給呼叫端。重試期間每一次嘗試的串流事件一樣即時轉發，讓使用者
+        看得到模型仍在運作，不會整段卡住無回應。）
     """
-    thinking_parts: List[str] = []
-    response_parts: List[str] = []
+    max_attempts = Tool.RETRY_MAX + 1  # §6：最多重試 2 次 = 最多嘗試 3 次。
+    reason_content = ""
+    content = ""
     tool_calls: List[Dict[str, Any]] = []
+    catalog_error: Optional[Tool.ToolError] = None
 
-    for event, data in LLM.stream_answer(request_payload):
-        if event == "thought_chunk":
-            thinking_parts.append(data or "")
-            yield event, data
-        elif event == "response_chunk":
-            response_parts.append(data or "")
-            yield event, data
-        elif event == "tool_calls":
-            tool_calls = data or []
-        elif event == "end":
-            break
+    for attempt in range(max_attempts):
+        thinking_parts: List[str] = []
+        response_parts: List[str] = []
+        tool_calls = []
 
-    reason_content = "".join(thinking_parts)
-    content = "".join(response_parts)
-    _log_reasoning_token_usage(reason_content)
+        for event, data in LLM.stream_answer(request_payload):
+            if event == "thought_chunk":
+                thinking_parts.append(data or "")
+                yield event, data
+            elif event == "response_chunk":
+                response_parts.append(data or "")
+                yield event, data
+            elif event == "tool_calls":
+                tool_calls = data or []
+            elif event == "end":
+                break
 
-    action = decide_action(tool_calls)
+        reason_content = "".join(thinking_parts)
+        content = "".join(response_parts)
+        _log_reasoning_token_usage(reason_content)
 
-    if action is Action.FINAL_ANSWER:
-        # §4「無需呼叫工具」分支①②③：content 即最終回覆，寫回歷史，
-        # 由呼叫端（Harness）透過 Frontend 回傳給使用者。
-        Harness.append_assistant_message(session_id, content)
-        yield ("end", None)
-        return
+        action = decide_action(tool_calls)
 
-    # Action.TOOL_CALL
-    try:
-        validate_tool_calls(tool_calls)
-    except ToolCallFormatError as exc:
-        # §5：工具呼叫格式錯誤 -> 不執行工具，立即回傳錯誤提示，要求重新提問。
-        logger.error("ToolCallFormatError: %s", exc)
-        error_notice = "⚠️ 工具呼叫指令格式有誤，暫時無法處理，請重新描述您的問題。"
+        if action is Action.FINAL_ANSWER:
+            # §4「無需呼叫工具」分支①②③：content 即最終回覆，寫回歷史，
+            # 由呼叫端（Harness）透過 Frontend 回傳給使用者。重試迴圈中途
+            # 模型改變主意、不再需要工具了，一樣視為正常結束，不算重試失敗。
+            Harness.append_assistant_message(session_id, content)
+            yield ("end", None)
+            return
+
+        # Action.TOOL_CALL：先做 §5 結構檢查，此檢查失敗代表模型連 JSON 都
+        # 吐不出來，不屬於 ToolCalling.md §6「白名單/型態錯誤」的重試範圍，
+        # 不重試，直接回錯誤提示。
+        try:
+            validate_tool_calls(tool_calls)
+        except ToolCallFormatError as exc:
+            logger.error("ToolCallFormatError: %s", exc)
+            error_notice = "⚠️ 工具呼叫指令格式有誤，暫時無法處理，請重新描述您的問題。"
+            Harness.append_assistant_message(session_id, error_notice)
+            yield ("response_chunk", error_notice)
+            yield ("end", None)
+            return
+
+        # ToolCalling.md §6：白名單/必填參數/型態檢查。
+        try:
+            Tool.validate_against_catalog(tool_calls)
+            catalog_error = None
+            break  # 通過驗證，跳出重試迴圈，往下走「暫存 + 降級回覆」。
+        except Tool.ToolError as exc:
+            catalog_error = exc
+            if attempt >= max_attempts - 1:
+                break  # §6：重試次數用盡，往下走「回傳錯誤提示」。
+            logger.warning(
+                "Tool 白名單/型態驗證失敗（第 %d/%d 次嘗試）：%s，要求模型重新生成 tool_calls",
+                attempt + 1,
+                max_attempts,
+                exc,
+            )
+            request_payload = _append_retry_notice(request_payload, exc)
+            continue
+
+    if catalog_error is not None:
+        # §6：重試 Tool.RETRY_MAX 次仍失敗 -> 不執行工具，立即回傳錯誤提示，
+        # 要求使用者重新提問（比照 §5 格式錯誤的既有降級文案風格）。
+        logger.error(
+            "工具呼叫白名單/型態驗證重試 %d 次後仍失敗：%s", Tool.RETRY_MAX, catalog_error
+        )
+        error_notice = "⚠️ 工具呼叫指令內容有誤，暫時無法處理，請重新描述您的問題。"
         Harness.append_assistant_message(session_id, error_notice)
         yield ("response_chunk", error_notice)
         yield ("end", None)
         return
 
-    # §4「需呼叫工具」分支①②：暫存推理草稿與工具呼叫，供未來 Tool/Guardrails
-    # 管線接上後由 resume_with_tool_result() 做第二輪推理。
+    # §4「需呼叫工具」分支①②：驗證通過，暫存推理草稿與工具呼叫，供未來
+    # Guardrails/ 與工具執行管道接上後由 resume_with_tool_result() 做第二輪
+    # 推理。
     _stash_pending_reasoning(session_id, reason_content, tool_calls)
 
-    # Tool/、Guardrails/ 尚未實作：無法真的執行§4「需呼叫工具」分支①（交付
-    # 工具管線）與③（等待結果後做第二輪推理），本輪先以降級文字結束對話，
-    # 並清空剛剛暫存的狀態（不會再有人來 resume 這一輪）。若模型本身已經給了
-    # 一段簡短引導文字（content 非空），維持原意用它當這一輪的回覆，不疊加
-    # 降級說明。
+    # 工具執行管道（Guardrails/）尚未實作：無法真的執行§4「需呼叫工具」分支
+    # ①（交付工具管線）與③（等待結果後做第二輪推理），本輪先以降級文字結束
+    # 對話，並清空剛剛暫存的狀態（不會再有人來 resume 這一輪）。若模型本身
+    # 已經給了一段簡短引導文字（content 非空），維持原意用它當這一輪的回覆，
+    # 不疊加降級說明。
     final_text = content or _tool_pipeline_unavailable_notice(tool_calls)
     if not content:
         yield ("response_chunk", final_text)
@@ -183,30 +260,32 @@ def resume_with_tool_result(
 ) -> Iterator[Event]:
     """
     對應 Architect/Architect.md 循序圖步驟 ⑭–⑰／LLMReasoning.md §4「需呼叫
-    工具」分支③：工具管線（Tool/、Guardrails/）執行完成、拿到結果後，結合
-    本輪暫存的 pending_reason_content 與 tool_results 做第二輪推理，產生
-    最終自然語言回覆。
+    工具」分支③：工具執行管道（Guardrails/ 的安全審查 + 真正呼叫工具）完成、
+    拿到結果後，結合本輪暫存的 pending_reason_content 與 tool_results 做
+    第二輪推理，產生最終自然語言回覆。
 
-    目前 Tool/、Guardrails/ 套件都還沒實作，沒有任何呼叫端會呼叫這個函式；
-    先把介面（函式簽名、輸入輸出格式）定義出來，讓未來這兩個套件完工時可以
-    直接接上，呼叫端（未來的 Tool/ 管線或 Frontend）不需要再改介面。
+    Tool/ 套件（本次已實作的白名單驗證與重試判斷）只負責「判斷該不該呼叫、
+    呼叫合不合法」，不負責「真的去執行」；Guardrails/ 與真正的工具執行管道
+    仍未實作，沒有任何呼叫端會呼叫這個函式。先把介面（函式簽名、輸入輸出
+    格式）定義出來，讓未來這兩者完工時可以直接接上，呼叫端（未來的工具
+    執行管道或 Frontend）不需要再改介面。
 
     Args:
         session_id: 本輪對話的 Session ID，需帶有 process() 暫存的
             pending_reason_content／pending_tool_calls（透過
             Harness.SESSION_STORE.get(session_id) 取得）。
-        tool_results: 工具管線回傳的結果列表（格式對應 Tool/ 套件的輸出，
-            目前尚未定義）。
+        tool_results: 工具執行管道回傳的結果列表（格式對應未來 Guardrails/
+            或工具執行管道的輸出，目前尚未定義）。
 
     Yields:
         跟 process() 相同的事件格式。
 
     Raises:
-        NotImplementedError: 需等 Tool/、Guardrails/ 套件完成後，才能真正
+        NotImplementedError: 需等 Guardrails/ 與工具執行管道完成後，才能真正
             組出含工具結果的第二輪 messages 並重新呼叫 LLM.stream_answer()。
     """
     raise NotImplementedError(
-        "resume_with_tool_result 尚未實作：需等 Tool/、Guardrails/ 套件完成，"
+        "resume_with_tool_result 尚未實作：需等 Guardrails/ 與工具執行管道完成，"
         "才能組出第二輪推理所需的工具結果訊息並重新呼叫 LLM。"
     )
 
