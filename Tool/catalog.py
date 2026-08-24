@@ -21,6 +21,12 @@ Tool/catalog.py
 natural_language_query」，用標準 JSON Schema 的 "anyOf": [{"required": [...]}]
 表示「至少滿足其中一種」，Tool/validation.py 看得懂這個結構，不需要另外
 自訂欄位。
+
+`knowledge_base_search` 是 Architect/ToolExecution.md 實作時新增的第七個
+工具：ToolCalling.md §3 原本的 `file_read` 是「頁碼式擷取」語意（file_id +
+start_page/end_page），跟「輸入一段自然語言 query，向量檢索最相似片段」的
+RAG 語意不同，硬塞進 file_read 只會讓兩種語意互相打架，所以另開一個工具，
+專門對應 Backend/rag/ 子系統（BGE-M3 embedding + Qdrant 向量檢索）。
 """
 
 from __future__ import annotations
@@ -144,6 +150,23 @@ _TOOL_SPECS: List[ToolSpec] = [
                 "params": {"type": "object", "description": "查詢參數"},
             },
             required=["url", "method"],
+        ),
+    ),
+    ToolSpec(
+        name="knowledge_base_search",
+        description=(
+            "在已建置的知識庫中做語意（向量）相似度檢索，回傳最相關的段落。"
+            "觸發時機：使用者問題要求「根據知識庫/已匯入文件」回答、或需要"
+            "從大量已索引文件中找出語意相關段落時使用；不要用於頁碼式擷取"
+            "（那屬於 file_read）或即時網路資訊（那屬於 web_search）。"
+        ),
+        parameters=_schema(
+            properties={
+                "query": {"type": "string", "description": "自然語言查詢，將被轉成向量做相似度檢索"},
+                "top_k": {"type": "integer", "description": "回傳筆數上限，預設由伺服器端設定決定"},
+                "collection": {"type": "string", "description": "指定檢索的知識庫集合名稱，未提供則用預設集合"},
+            },
+            required=["query"],
         ),
     ),
 ]
