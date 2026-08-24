@@ -28,3 +28,21 @@ REASONING_EFFORT: str = "medium"
 
 # --- §6 效能指標：推理草稿 token 使用率門檻（超過就記警告，不中斷流程） --------
 REASONING_TOKEN_WARN_RATIO: float = 0.8
+
+# --- Architect/AgentLoop.md §6 效能指標：第二輪推理 Token 總消耗上限 ------------
+AGENT_LOOP_MAX_CONTEXT_TOKENS: float = 4096
+
+# --- AgentLoop.md §5「結果超過 Token 限制」：壓縮摘要子程序的目標大小 -----------
+AGENT_LOOP_SUMMARY_TARGET_TOKENS: float = 300
+
+# --- AgentLoop.md §4：confidence_score 低於此門檻，建議前端顯示免責聲明 ---------
+LOW_CONFIDENCE_THRESHOLD: float = 0.6
+
+# --- AgentLoop.md §5「原始草稿與結果嚴重衝突」：強制觸發的信心指數降級量 --------
+CONFLICT_CONFIDENCE_PENALTY: float = 0.3
+
+# --- AgentLoop.md §5「時間敏感資訊」：工具結果超過此秒數視為過期（1 小時） ------
+STALE_RESULT_SECONDS: float = 60 * 60
+
+# --- AgentLoop.md §6 效能指標：端對端延遲（P95）警告門檻，供 log 監控使用 -------
+AGENT_LOOP_E2E_LATENCY_WARN_SECONDS: float = 5.0

@@ -17,12 +17,22 @@ Guardrails/ 套件（目前尚未實作）的職責。
 並在過程中記錄 §5「效能與監控指標」：tool_execution_duration、
 truncation_occurred（tool_result_compression_ratio 的告警在 processor.py
 內完成，這裡只記錄耗時與是否截斷）。
+
+額外在 FinalToolResult.metadata 寫入 `completed_at`（UTC ISO 時間戳）：
+這是 Architect/AgentLoop.md §5「時間敏感資訊」邊界條件的需求——第二輪推理
+（LLMReasoning/agent_loop.py 的 is_stale()）需要比對「工具結果是何時取得的」
+與目前系統時間，才能判斷是否已超過 1 小時而需要在回覆中註明時效性；
+原本只有 execution_time_ms（耗時），沒有絕對時間可供比對，故補上。統一用
+UTC 記錄（內部用途，不是要顯示給使用者看的時間，跟 Harness/ 那組面向使用者
+的 +08:00 時區顯示無關，故不共用 Harness.config.TIMEZONE_OFFSET_HOURS，
+避免 Backend/ 反過來依賴 Harness/）。
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 
 from Backend.adapters import ADAPTER_REGISTRY
 from Backend.config import MAX_RESULT_LENGTH_DEFAULT
@@ -30,6 +40,11 @@ from Backend.models import ErrorDetail, FinalToolResult, RawToolResponse, ToolEx
 from Backend.processor import process_response
 
 logger = logging.getLogger("backend.pipeline")
+
+
+def _completed_at_iso() -> str:
+    """UTC ISO 時間戳，供 AgentLoop.md §5 時效性比對使用（見上方模組說明）。"""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def execute_tool(request: ToolExecutionRequest) -> FinalToolResult:
@@ -58,7 +73,9 @@ def execute_tool(request: ToolExecutionRequest) -> FinalToolResult:
                 code="UNKNOWN_TOOL", message=f"工具「{request.tool_name}」尚無對應的執行邏輯。"
             ),
         )
-        return process_response(raw, max_result_length)
+        final = process_response(raw, max_result_length)
+        final.metadata["completed_at"] = _completed_at_iso()
+        return final
 
     t0 = time.perf_counter()
     raw = adapter(request)  # PermissionError 在這裡不攔截，原樣往外拋給呼叫端。
@@ -66,6 +83,7 @@ def execute_tool(request: ToolExecutionRequest) -> FinalToolResult:
     raw.metadata.setdefault("execution_time_ms", round(elapsed_ms, 1))
 
     final = process_response(raw, max_result_length)
+    final.metadata["completed_at"] = _completed_at_iso()
 
     # §5 效能與監控指標。
     logger.info(
