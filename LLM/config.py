@@ -40,3 +40,10 @@ READ_TIMEOUT_SECONDS: float = 300.0
 # 對應 Harness 送來的 request_payload["thinking_mode"]；這裡僅作為該欄位
 # 缺漏時的備援預設值，實際開關以每次請求的 payload 為準。
 DEFAULT_THINK: bool = True
+
+# --- API 逾時重試（Architect/LLMReasoning.md §5：「LLM API 逾時」->「重試
+# 最多 2 次（指數退避），逾時後回傳友善降級回答」）------------------------------
+# 只在「這次嘗試完全沒收到任何一個串流 chunk」就逾時時才重試整個請求，見
+# LLM/ollama_client.py 的實作說明；已經開始吐出內容後才卡住不重試。
+API_RETRY_MAX: int = 2
+API_RETRY_BACKOFF_BASE_SECONDS: float = 1.0

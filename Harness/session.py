@@ -8,11 +8,14 @@ Session 是「會話容器」的唯一識別碼，掛載：
   - history：壓縮後的歷史對話陣列。
   - system_prompt_version：當前使用的系統提示詞版本號。
   - tool_auth_status：工具權限狀態。
+  - pending_reason_content／pending_tool_calls：Architect/LLMReasoning.md
+    §4「需呼叫工具」分支②新增的暫存欄位，見下方 SessionState 定義說明。
 
 狀態儲存位置：本模組內的行程內（in-memory）字典 `SessionStore._sessions`，
 以 threading.Lock 保護並發存取。這是目前單一 Gradio 行程部署下最簡單可行
 的實作；規格書允許 Redis 或 Memory 兩種選項，之後若要換成 Redis，只需要
-替換 SessionStore 內部實作，呼叫端（Harness.harness）的介面不需變動。
+替換 SessionStore 內部實作，呼叫端（Harness.harness、LLMReasoning.reasoning）
+的介面不需變動。
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from Harness.config import MAX_HISTORY_MESSAGES, SESSION_TTL_SECONDS
 from Harness.errors import HistoryCorrupted, invalid_session_error
@@ -36,6 +39,14 @@ class SessionState:
     system_prompt_version: Optional[str] = None
     tool_auth_status: Dict[str, bool] = field(default_factory=dict)
     last_active_at: float = field(default_factory=time.time)
+    # Architect/LLMReasoning.md §4「需呼叫工具」分支②：暫存本輪的內部推理
+    # 草稿（reason_content）與原始 tool_calls，供 Tool/、Guardrails/ 管線
+    # 完工後，由 LLMReasoning.resume_with_tool_result() 接手做第二輪推理。
+    # 兩者只在「這一輪正在等待工具管線處理」的期間有值，其餘時間應為
+    # None（LLMReasoning.process() 在無需工具、或工具管線尚未實作而降級
+    # 回覆之後，都會把這兩個欄位清空）。
+    pending_reason_content: Optional[str] = None
+    pending_tool_calls: Optional[List[Dict[str, Any]]] = None
 
     def touch(self) -> None:
         self.last_active_at = time.time()
@@ -48,6 +59,8 @@ class SessionState:
         self.history = []
         self.system_prompt_version = None
         self.tool_auth_status = {}
+        self.pending_reason_content = None
+        self.pending_tool_calls = None
         self.touch()
 
     def get_history_messages(self) -> List[Message]:

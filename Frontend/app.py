@@ -2,7 +2,7 @@
 """
 Frontend/app.py
 ----------------
-左右雙欄 AI 對話網站 (Gradio 實作，後端串接 LLM/ 模組呼叫本機 Ollama)
+左右雙欄 AI 對話網站 (Gradio 實作，後端串接 LLMReasoning/ 模組呼叫本機 Ollama)
 """
 
 import html
@@ -18,7 +18,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import Harness
-import LLM
+import LLMReasoning
 
 
 # ----------------------------------------------------------------------------
@@ -439,14 +439,17 @@ def bot_response(history, session_id):
         return
 
     # 把 Harness 組好的完整 payload（系統提示詞 + 歷史對話 + 這句清理過的
-    # 提問）交給 LLM/ 模組，而不是只送清理後的使用者文字——這樣系統提示詞
-    # 與歷史對話才會真的送進模型，不會被丟掉。
+    # 提問）交給 LLMReasoning/ 模組，而不是只送清理後的使用者文字——這樣
+    # 系統提示詞與歷史對話才會真的送進模型，不會被丟掉。LLMReasoning.process()
+    # 內部會呼叫 LLM/ 模組取得回應、判定是否需要呼叫工具，並把這一輪的
+    # 完整回覆寫回 Session 歷史，Frontend 不用再手動呼叫
+    # Harness.append_assistant_message。
     history = history + [{"role": "assistant", "content": ""}]
 
     thought_acc = ""
     response_acc = ""
 
-    for event, data in LLM.stream_answer(request_payload):
+    for event, data in LLMReasoning.process(session_id, request_payload):
         if event == "thought_chunk":
             thought_acc += data
             # 串流中保持停用狀態
@@ -459,8 +462,6 @@ def bot_response(history, session_id):
 
         elif event == "end":
             history[-1]["content"] = response_acc
-            # 把這輪的完整回覆寫回 Session 歷史，供下一輪對話延續上下文。
-            Harness.append_assistant_message(session_id, response_acc)
             # 串流結束，重新啟用輸入框與發送按鈕
             yield history, render_thought_html(thought_acc), gr.update(interactive=True), gr.update(interactive=True), session_id
 

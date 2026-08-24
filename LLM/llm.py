@@ -3,23 +3,28 @@
 LLM/llm.py
 ------------
 取代 Frontend/fake_backend.py：對應 Architect/Architect.md 循序圖步驟
-⑤-⑧（送出完整 Prompt → 深度思考 → 判斷不需要工具 → 直接回覆這條分支）。
+⑤-⑥（送出完整 Prompt → 深度思考），把 Ollama 的串流回應轉成呼叫端看得懂
+的事件。
+
+只負責「跟 Ollama 溝通、把串流 chunk 轉成事件」，不做任何決策——要不要
+呼叫工具（步驟⑦判定）、要不要把回覆寫回 Session 歷史，都是 LLMReasoning/
+套件的職責（見 Architect/LLMReasoning.md §3.3、§4 與 LLMReasoning/reasoning.py）。
+這裡刻意保持「無狀態、無業務判斷」，換模型供應商（例如之後改接
+DeepSeek-V3 官方 API）時，只需要重寫這個套件，LLMReasoning/ 的決策邏輯
+完全不用動。
 
 只吃 Harness.handle_turn() 組好的完整 request_payload（含系統提示詞、
 歷史對話、使用者提問、tools、thinking_mode——見 Architect/PreparatoryPhase.md
-§4.3），呼叫本機 Ollama 服務，並把串流回應轉成跟 fake_backend.stream_answer()
-完全相同的事件格式，讓 Frontend/app.py 只需要換一行呼叫對象，其餘串流／
-打字機顯示邏輯完全不用改：
+§4.3），呼叫本機 Ollama 服務，並把串流回應轉成統一的事件格式：
 
     ("thought_chunk",  <思考內容片段>)
     ("response_chunk", <最終回覆片段>)
-    ("end",            None)
+    ("tool_calls",       <本輪模型要求呼叫的完整 tool_calls 列表，僅在非空時送出>)
+    ("end",              None)
 
-工具呼叫這條分支（步驟 ⑨ 以後：Guardrails 審核 → 實際執行工具 → 把結果
-餵回模型做第二輪推理）尚未實作，屬於 Tool/、Guardrails/ 套件的範圍
-（AGENTS.md：先讓最小版本端到端可用，工具管線之後再疊上去）。目前如果
-模型回傳 tool_calls，這裡只會記錄警告、用一段說明文字充當回覆，不會
-真的去呼叫任何工具，也不會把 tool_calls 送回模型做第二輪推理。
+呼叫端（目前是 LLMReasoning.process()）自行決定要不要轉發 thought_chunk／
+response_chunk 給前端顯示，並依有沒有收到 "tool_calls" 事件判斷後續動作；
+本模組不做這個判斷。
 """
 
 from __future__ import annotations
@@ -33,7 +38,7 @@ from LLM.ollama_client import stream_chat
 
 logger = logging.getLogger("llm")
 
-Event = Tuple[str, Optional[str]]
+Event = Tuple[str, Optional[Any]]
 
 
 def _to_ollama_tools(tool_definitions: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
@@ -61,21 +66,6 @@ def _to_ollama_tools(tool_definitions: List[Dict[str, Any]]) -> Optional[List[Di
     ]
 
 
-def _tool_calls_placeholder(tool_calls: List[Dict[str, Any]]) -> str:
-    """
-    「Tool/ 尚未實作」的降級行為：模型想呼叫工具，但目前沒有工具執行管線
-    可以接手處理，於是記錄警告並回傳一段對使用者誠實的說明文字，而不是
-    靜默吞掉、留一顆永遠空白的回覆泡泡給使用者。
-    """
-    names = ", ".join(
-        call.get("function", {}).get("name", "unknown") for call in tool_calls
-    ) or "unknown"
-    logger.warning(
-        "模型要求呼叫工具（%s），但 Tool/Guardrails 管線尚未實作，略過執行。", names
-    )
-    return f"（這個問題可能需要使用工具「{names}」協助回答，但工具執行功能尚未上線，暫時無法提供。）"
-
-
 def stream_answer(request_payload: Dict[str, Any]) -> Iterator[Event]:
     """
     對應 fake_backend.stream_answer() 的介面，但吃的是 Harness 組好的
@@ -94,7 +84,6 @@ def stream_answer(request_payload: Dict[str, Any]) -> Iterator[Event]:
     thinking_mode = request_payload.get("thinking_mode", DEFAULT_THINK)
     tools = _to_ollama_tools(request_payload.get("tools") or [])
 
-    response_acc = ""
     tool_calls: List[Dict[str, Any]] = []
 
     try:
@@ -112,7 +101,6 @@ def stream_answer(request_payload: Dict[str, Any]) -> Iterator[Event]:
 
             content_delta = message.get("content")
             if content_delta:
-                response_acc += content_delta
                 yield ("response_chunk", content_delta)
 
             if message.get("tool_calls"):
@@ -122,18 +110,19 @@ def stream_answer(request_payload: Dict[str, Any]) -> Iterator[Event]:
                 break
 
     except LLMError as exc:
-        # 連不上 Ollama、模型不存在、回應格式錯誤：不要整個往外拋出讓
-        # Gradio 顯示原始 traceback，改成在回覆泡泡裡給使用者看得懂的
-        # 錯誤訊息，並正常結束這一輪串流（重新啟用輸入框）。
+        # 連不上 Ollama、模型不存在、回應格式錯誤（含逾時重試後仍失敗，見
+        # LLM/ollama_client.py）：不要整個往外拋出讓 Gradio 顯示原始
+        # traceback，改成在回覆泡泡裡給使用者看得懂的錯誤訊息，並正常結束
+        # 這一輪串流（重新啟用輸入框）。
         logger.error("LLM 串流失敗：%s", exc)
         yield ("response_chunk", f"⚠️ 無法取得模型回覆：{exc}")
         yield ("end", None)
         return
 
-    if tool_calls and not response_acc:
-        # 模型只給了 tool_calls、完全沒有 content：補一段說明文字，讓
-        # 使用者至少知道發生了什麼事，而不是看到一顆永遠空白的回覆泡泡。
-        yield ("response_chunk", _tool_calls_placeholder(tool_calls))
+    if tool_calls:
+        # 是否要因此走「工具呼叫」分支，交給呼叫端（LLMReasoning.process）
+        # 的 decide_action() 判斷，這裡只負責忠實回報模型講了什麼。
+        yield ("tool_calls", tool_calls)
 
     yield ("end", None)
 
