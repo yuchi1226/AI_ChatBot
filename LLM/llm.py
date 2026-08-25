@@ -47,7 +47,7 @@ def _to_ollama_tools(tool_definitions: List[Dict[str, Any]]) -> Optional[List[Di
     格式，見 Architect/PreparatoryPhase.md §4.1）轉成 Ollama `/api/chat`
     要求的 tools 格式（OpenAI function-calling 風格的巢狀結構）。
 
-    目前 System/system_prompt_cache.py 的 default 範本 tool_definitions
+    目前 Prompt/system_prompt_cache.py 的 default 範本 tool_definitions
     是空陣列，這個轉換函式先做好，等之後真的掛上工具定義、也做完
     Tool/Guardrails 管線後即可直接生效，呼叫端不需要再改。
     """

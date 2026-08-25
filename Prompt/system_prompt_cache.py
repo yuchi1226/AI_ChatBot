@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-System/system_prompt_cache.py
+Prompt/system_prompt_cache.py
 -------------------------------
 系統提示詞緩存（System Prompt Cache）。
 

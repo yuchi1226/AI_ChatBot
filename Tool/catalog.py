@@ -5,7 +5,7 @@ Tool/catalog.py
 工具白名單 + JSON Schema 定義，對應 Architect/ToolCalling.md §3「工具分類與
 觸發條件」。這是整個 Tool/ 套件唯一的資料來源（single source of truth）：
 
-  - System/system_prompt_cache.py 從這裡取得 tool_definitions，塞進系統
+  - Prompt/system_prompt_cache.py 從這裡取得 tool_definitions，塞進系統
     提示詞與送給 LLM 的 payload["tools"]（讓模型知道有哪些工具可用、
     什麼時候該用）。
   - Tool/validation.py 從這裡取得白名單與參數 schema，驗證模型實際吐出的
@@ -179,7 +179,7 @@ TOOL_CATALOG: Dict[str, ToolSpec] = {spec.name: spec for spec in _TOOL_SPECS}
 def get_tool_definitions() -> List[Dict[str, Any]]:
     """
     以 Architect/PreparatoryPhase.md §4.1 範本的「平鋪」格式（name/description/
-    parameters）回傳工具清單，供 System/system_prompt_cache.py 塞進
+    parameters）回傳工具清單，供 Prompt/system_prompt_cache.py 塞進
     prompt_block["content"]["tool_definitions"]；LLM/llm.py 既有的
     _to_ollama_tools() 會再把這個平鋪格式轉成 Ollama 要的巢狀 function-calling
     結構，這裡不需要重複組裝。

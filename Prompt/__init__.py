@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-System/
+Prompt/
 -------
 系統提示詞緩存（System Prompt Cache）。
 
@@ -13,7 +13,7 @@ Architect/PreparatoryPhase.md（Harness.md 3.2 節步驟 A「注入系統級指�
 system_prompt_cache.py 內部實作，呼叫端（Harness）的介面不需要變動。
 """
 
-from System.system_prompt_cache import (
+from Prompt.system_prompt_cache import (
     CURRENT_DATE_PLACEHOLDER,
     FALLBACK_PROMPT_BLOCK,
     GLOBAL_DEFAULT_SAFETY_GUARDRAILS,

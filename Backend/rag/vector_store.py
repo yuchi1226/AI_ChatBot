@@ -7,7 +7,7 @@ Backend/rag/vector_store.py
 
 這是整個 Backend/ 套件唯一「真正持久化」的狀態儲存位置，見
 Backend/rag/config.py 的 QDRANT_STORAGE_PATH：其餘套件（Harness.SESSION_STORE、
-System 的提示詞快取）都是行程內記憶體，重啟即歸零；Qdrant 的資料庫檔案則
+Prompt 的提示詞快取）都是行程內記憶體，重啟即歸零；Qdrant 的資料庫檔案則
 留在磁碟上，跨行程重啟仍在。
 
 search() 回傳 [{"uuid", "score", "content", "metadata"}, ...]，這正是

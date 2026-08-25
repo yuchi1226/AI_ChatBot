@@ -8,7 +8,7 @@ LLM/config.py
 
 這裡刻意用環境變數做覆蓋，而不是寫死常數：Ollama 的服務位址與模型 tag
 是「跑在哪台機器、拉了哪個模型」這種部署環境相關的資訊，跟 Harness/、
-System/ 那些「規格本身就固定」的常數性質不同。
+Prompt/ 那些「規格本身就固定」的常數性質不同。
 """
 
 from __future__ import annotations

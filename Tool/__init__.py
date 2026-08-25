@@ -15,7 +15,7 @@ Guardrails/ 與工具執行管道實作。
 
     import Tool
 
-    definitions = Tool.get_tool_definitions()   # 塞進系統提示詞（System/ 使用）
+    definitions = Tool.get_tool_definitions()   # 塞進系統提示詞（Prompt/ 使用）
     Tool.validate_against_catalog(tool_calls)    # 白名單/型態驗證（LLMReasoning/ 使用）
 """
 

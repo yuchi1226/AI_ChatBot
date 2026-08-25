@@ -25,7 +25,7 @@ from Harness.errors import HarnessError, HistoryCorrupted, PromptFetchFailed, em
 from Harness.payload import assemble_request
 from Harness.session import SESSION_STORE
 from Harness.text_preprocessing import clean_plain_text
-from System.system_prompt_cache import FALLBACK_PROMPT_BLOCK, get_system_prompt
+from Prompt.system_prompt_cache import FALLBACK_PROMPT_BLOCK, get_system_prompt
 
 logger = logging.getLogger("harness")
 

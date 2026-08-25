@@ -349,7 +349,7 @@ def resume_with_tool_result(
         request_payload: 本輪第一次呼叫 LLM 時用的完整請求載荷（Harness
             組好的 messages/tools/thinking_mode/...）。第二輪在其 messages
             尾端追加一則 §3.1 組好的增強脈絡訊息後重新送出，沿用同一份
-            系統提示詞與歷史對話，不重新呼叫 Harness／System 拉取。
+            系統提示詞與歷史對話，不重新呼叫 Harness／Prompt 拉取。
         tool_results: 工具執行管道（Backend.execute_tool()）回傳的結果列表。
         user_query: 這一輪的原始使用者提問，供 §3.1 reassemble_context()
             的「用戶提問」分區使用。process() 一律會傳入（在其重試迴圈

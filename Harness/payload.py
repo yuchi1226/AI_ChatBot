@@ -6,7 +6,7 @@ Harness/payload.py
 Architect/PreparatoryPhase.md 的規格強化「步驟 A 注入系統級指令」這一段：
 
   步驟 A：注入系統級指令 -> 由呼叫端（Harness.harness）透過
-            System.get_system_prompt() 取得範本，再交給本模組渲染。
+            Prompt.get_system_prompt() 取得範本，再交給本模組渲染。
   步驟 B：結構化提示詞建構 -> render_system_prompt_content()
             - §3 內部「參數填補」：尋找範本中的 {{current_date}} 佔位符並替換；
               §5「範本缺少必要佔位符」時，改為自動於末尾附加「目前日期：...」。
@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Tuple
 from Harness.config import DEFAULT_MODE, MAX_SYSTEM_PROMPT_TOKENS, TIMEZONE_OFFSET_HOURS
 from Harness.session import Message
 from Harness.text_preprocessing import approx_token_count, truncate_keep_head
-from System.system_prompt_cache import CURRENT_DATE_PLACEHOLDER
+from Prompt.system_prompt_cache import CURRENT_DATE_PLACEHOLDER
 
 _TZ = timezone(timedelta(hours=TIMEZONE_OFFSET_HOURS))
 
@@ -147,7 +147,7 @@ def assemble_request(
 
     Args:
         session_id: 本次會話的 Session ID。
-        prompt_block: System.get_system_prompt() 取得的範本（含 content / metadata）。
+        prompt_block: Prompt.get_system_prompt() 取得的範本（含 content / metadata）。
         history_messages: 從 Session 拉取的歷史對話陣列。
         user_query: 步驟 2 處理後的純文字輸入（僅透過 "user" 角色傳遞，
             絕不直接拼入系統提示詞——PreparatoryPhase.md §7 提示詞注入防護）。
