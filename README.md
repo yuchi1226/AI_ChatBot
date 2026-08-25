@@ -8,10 +8,6 @@
 
 - **透明思考鏈 UI**：右側思考區以步驟化事件（`Trace.StepEvent`）即時串流顯示 Harness／LLMReasoning 內部各步驟的進度，而非等到生成完畢才一次跳出。
 - **Agent Loop（第二輪推理）**：模型呼叫工具後，會將工具回傳結果與第一輪的思考草稿重新送入模型，做語意校準與衝突偵測，最終產生 `final_answer`、`confidence_score`（信心分數 < 0.6 時建議顯示免責聲明）、`cited_sources` 等結構化輸出。
-- **7 種內建工具**：`web_search`、`file_read`、`code_interpreter`、`database_query`、`file_write`、`http_request`、`knowledge_base_search`，皆以 JSON Schema 定義於 `Tool/catalog.py`，是系統提示詞與參數驗證的唯一資料來源。
-- **RAG 知識庫檢索**：BGE-M3 embedding（透過本機 Ollama `/api/embed`）+ Qdrant 向量資料庫（embedded 本地模式，資料寫在本機磁碟，不需另外起 Qdrant 服務或 Docker）。
-- **免金鑰網路搜尋**：透過 `ddgs` 套件呼叫 DuckDuckGo，不需申請 API Key。
-- **安全守衛（Guardrails）**：預留 pre-execution hook 架構（步驟⑨），目前為最小可用 stub——一律放行，但仍會誠實地在思考區顯示「尚未審查」的狀態。
 
 ## 專案結構
 
@@ -22,15 +18,6 @@ AI_ChatBot/
 ├── AGENTS.md             開發原則（模組化、簡單優先、不做向下相容等）
 ├── diagram.png           架構循序圖（渲染版）
 ├── Architect/            規格書：對應循序圖每個步驟的詳細設計文件
-│   ├── Architect.md          循序圖總覽
-│   ├── PreparatoryPhase.md   準備階段：系統提示詞注入（步驟③④）
-│   ├── Harness.md             核心調度：輸入前處理與請求建構（步驟①～⑥）
-│   ├── LLMReasoning.md        LLM 推理與工具呼叫判斷（步驟⑤⑥⑦）
-│   ├── ToolCalling.md         工具調用判斷模組（步驟⑦）
-│   ├── ToolExecution.md       工具執行與結果處理（步驟⑩～⑬）
-│   ├── AgentLoop.md           第二輪推理機制（步驟⑭～⑰）
-│   ├── FrontendUIUX.md        前端 UI/UX 規格
-│   └── ThoughtPanelStep.md    思考區步驟化即時串流規格
 ├── Frontend/             Gradio UI：左右雙欄、步驟化思考區、複製/讚/踩按鈕
 │   └── app.py
 ├── Harness/              核心調度器：Session 管理、輸入前處理、Payload 組裝
@@ -41,7 +28,7 @@ AI_ChatBot/
 ├── Backend/              工具執行管道
 │   ├── adapters/             各工具的執行 adapter（web_search、file_read、code_interpreter…）
 │   ├── rag/                  RAG 子系統：BGE-M3 embedding + Qdrant 向量檢索
-│   └── websearch/             DuckDuckGo 網路搜尋（ddgs）
+│   └── websearch/            DuckDuckGo 網路搜尋（ddgs）
 ├── Guardrails/           安全守衛 pre-execution hook（目前為 stub，一律放行）
 └── Trace/                思考區步驟事件（StepEvent）共用資料結構
 ```
@@ -93,7 +80,6 @@ python main.py
 
 | 變數 | 預設值 | 說明 |
 | --- | --- | --- |
-| `OLLAMA_HOST` | `http://localhost:11434` | Ollama 服務位址 |
 | `LLM_OLLAMA_MODEL` | `gemma4:26b` | 對話所使用的 Ollama 模型 tag |
 | `BACKEND_FILE_WHITELIST_DIRS` | `./workspace` | 本地檔案 I/O 工具允許存取的白名單目錄（多個以 `os.pathsep` 分隔） |
 | `RAG_QDRANT_STORAGE_PATH` | `./Backend/rag/.qdrant_data` | Qdrant 向量資料庫的本地儲存目錄 |

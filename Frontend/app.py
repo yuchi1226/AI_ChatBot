@@ -383,7 +383,8 @@ body {
    第二個 Tab：說明內容
    ================================================================ */
 #about_panel {
-    max-width: 1000px;
+    max-width: 2000px;
+    width: 100%;
     margin: 0 auto;
 }
 
@@ -695,11 +696,7 @@ def build_demo() -> gr.Blocks:
         # ================================================================
         with gr.Tab(label="軌跡"):
             with gr.Column(elem_id="about_panel"):
-                gr.Markdown(
-                    """
-                        待放架構圖
-                    """
-                )
+                gr.Image("./diagram.png",width="100%")
 
         # ================================================================
         # 事件綁定
