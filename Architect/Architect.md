@@ -5,7 +5,7 @@ sequenceDiagram
     participant FE as 前端/API閘道器
     participant Harness as 🧠 核心調度器<br>(Agent Harness)
     participant System as 📜 系统提示詞緩存
-    participant LLM as 🤖 大語言模型<br>(DeepSeek-V3)
+    participant LLM as 🤖 大語言模型<br>
     participant ToolPipe as 🔧 工具執行管道<br>(Tool Pipeline)
     participant ExtTool as 🌐 外部工具<br>(搜索/文件/計算)
     participant Safety as 🛡️ 安全守衛<br>(Guardrails)

@@ -25,7 +25,7 @@ OLLAMA_HOST: str = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 # 對齊使用者本機 `ollama run qwen3...` 的模型系列。若實際拉的是特定尺寸的
 # tag（例如 qwen3:8b、qwen3:30b-a3b），設定環境變數 LLM_OLLAMA_MODEL 覆蓋，
 # 不用改程式碼；不設定時預設用 "qwen3"（交給 Ollama 解析成該模型的預設 tag）。
-OLLAMA_MODEL: str = os.environ.get("LLM_OLLAMA_MODEL", "qwen3.5:0.8b")
+OLLAMA_MODEL: str = os.environ.get("LLM_OLLAMA_MODEL", "gemma4:26b")
 
 # --- 逾時設定（秒）--------------------------------------------------------------
 # 連線逾時：Ollama 若完全連不上（服務未啟動、位址錯誤），應該很快就要失敗，
