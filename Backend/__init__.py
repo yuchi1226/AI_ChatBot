@@ -16,19 +16,24 @@ tool_name 的資料來源。
 
     import Backend
 
-    result = Backend.execute_tool(
+    for event, data in Backend.execute_tool(
         Backend.ToolExecutionRequest(
             tool_call_id="call_abc123",
             tool_name="web_search",
             arguments={"query": "台北天氣"},
             execution_mode="http",
         )
-    )
-    result.is_success, result.content   # 直接可以塞進第二輪推理的 tool 訊息
+    ):
+        if event == "step":
+            ...  # Trace.StepEvent，步驟⑩⑪⑫⑬ 的即時進度，轉發給前端思考區
+        elif event == "result":
+            final_result = data  # Backend.FinalToolResult
+            final_result.is_success, final_result.content   # 直接可以塞進第二輪推理的 tool 訊息
 
-目前尚未接上 LLMReasoning.resume_with_tool_result()（該函式仍是
-NotImplementedError stub，等 Guardrails/ 完工後再一併接線），呼叫端可以
-先獨立呼叫 Backend.execute_tool() 驗證這條管線本身的行為。
+Architect/ThoughtPanelStep.md §6.4：execute_tool() 已改為 generator，
+在步驟⑩⑪⑫⑬各自的動作*發生的當下*即時 yield 對應的 StepEvent，最終以
+("result", FinalToolResult) 收尾——不再是「呼叫一次、同步拿到最終結果」，
+呼叫端需要用 for 迴圈迭代。
 """
 
 from Backend.errors import BackendError, ToolConnectionError, ToolTimeoutError, UnknownAdapterError

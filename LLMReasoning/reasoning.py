@@ -22,12 +22,17 @@ Architect/ToolCalling.md §5、§6：
         對。不合法 -> 觸發 §6 規定的重試機制：在 messages 尾端附加修正提示，
         要求模型重新生成 tool_calls，最多 Tool.RETRY_MAX（2）次；重試次數
         用盡仍不合法，才回錯誤提示。
-    兩層檢查都通過後，把 reason_content／tool_calls 暫存進 Session，逐一
-    交付工具執行管道（Backend.execute_tool()，對應 Architect.md 循序圖
-    步驟⑧–⑬）執行，取得 tool_results 後立即流轉進 resume_with_tool_result()
-    做 Architect/AgentLoop.md §3.1–3.4 的第二輪推理（步驟⑭–⑰）。
-    Guardrails/ 的步驟⑨（權限/敏感詞審查、必要時的使用者授權確認）尚未
-    實作，這裡先跳過，見 process() 內的 TODO 註記。
+    兩層檢查都通過後，把 reason_content／tool_calls 暫存進 Session，經過
+    Guardrails.precheck()（步驟⑨）後逐一交付工具執行管道（Backend.execute_tool()，
+    對應 Architect.md 循序圖步驟⑧–⑬）執行，取得 tool_results 後立即流轉進
+    resume_with_tool_result() 做 Architect/AgentLoop.md §3.1–3.4 的第二輪推理
+    （步驟⑭–⑰）。
+
+Architect/ThoughtPanelStep.md §6.3、§6.6：process()／resume_with_tool_result()
+的事件全面改用統一的 ("step", Trace.StepEvent) 事件，取代舊版
+("thought_chunk"/"response_chunk"/"metadata", ...) 事件——步驟⑤⑥⑦A/⑦B、
+⑧A/⑧B、⑨、⑭⑮⑯⑰ 皆即時發射；confidence_score／cited_sources／
+reasoning_summary 併入步驟⑰的 StepEvent.meta，不再用獨立的 "metadata" 事件。
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import Backend
+import Guardrails
 import Harness
 import LLM
 import Tool
@@ -52,6 +58,7 @@ from LLMReasoning.agent_loop import (
     detect_conflicts,
     format_tool_results,
     is_stale,
+    needs_disclaimer,
     reassemble_context,
 )
 from LLMReasoning.config import (
@@ -60,6 +67,7 @@ from LLMReasoning.config import (
     REASONING_TOKEN_WARN_RATIO,
 )
 from LLMReasoning.errors import ToolCallFormatError
+from Trace.step_events import make_step_event
 
 logger = logging.getLogger("llm_reasoning")
 _audit_logger = logging.getLogger("audit.agent_loop")
@@ -191,17 +199,17 @@ def process(session_id: str, request_payload: Dict[str, Any]) -> Iterator[Event]
         request_payload: Harness.handle_turn() 回傳的完整請求載荷。
 
     Yields:
-        跟 LLM.stream_answer() 相同的事件格式，供呼叫端（Frontend）直接
-        轉發顯示：
-            ("thought_chunk",  <思考內容片段>)
-            ("response_chunk", <最終回覆片段>)
-            ("end",             None)
-        （LLM.stream_answer() 額外送出的 "tool_calls" 事件會在這裡被消化，
-        不會轉發給呼叫端。重試期間每一次嘗試的串流事件一樣即時轉發，讓使用者
-        看得到模型仍在運作，不會整段卡住無回應。若最終判定需要呼叫工具，
-        本函式會把事件流交給 resume_with_tool_result()（Architect/AgentLoop.md
-        §3.1–3.4 第二輪推理），該函式在 "end" 之前還會多送一個
-        ("metadata", agent_loop.SecondRoundResult) 事件，見其文件字串。）
+        ("step", Trace.StepEvent) — 步驟⑤⑥⑦⑧⑨…的即時進度事件，供呼叫端
+            （Frontend）直接轉發顯示；step_key 在 Trace.MIRRORS_TO_CHAT 內時，
+            其 delta 也要同步進左側聊天氣泡（見 Frontend/app.py）。
+        ("end", None) — 本輪對話結束。
+
+        （重試期間每一次嘗試的串流事件一樣即時轉發，讓使用者看得到模型仍在
+        運作，不會整段卡住無回應。若最終判定需要呼叫工具，本函式會把事件流
+        交給 resume_with_tool_result()（Architect/AgentLoop.md §3.1–3.4 第二輪
+        推理，步驟⑭–⑰），該函式在 "end" 之前還會多送一個步驟⑰的 StepEvent，
+        其 meta 帶有 confidence_score／cited_sources／reasoning_summary，
+        供前端「信心分數 < 0.6 顯示免責聲明」的 UI 使用。）
     """
     max_attempts = Tool.RETRY_MAX + 1  # §6：最多重試 2 次 = 最多嘗試 3 次。
     # 在重試迴圈開始「之前」擷取一次原始使用者提問：重試會在 messages 尾端
@@ -213,18 +221,50 @@ def process(session_id: str, request_payload: Dict[str, Any]) -> Iterator[Event]
     tool_calls: List[Dict[str, Any]] = []
     catalog_error: Optional[Tool.ToolError] = None
 
+    # 步驟⑤：發送完整 Prompt＋歷史對話＋提問（重試沿用同一次，不重複發射）。
+    yield "step", make_step_event(
+        "send_to_llm_r1",
+        status="success",
+        delta=(
+            f"歷史 {max(len(request_payload.get('messages', [])) - 2, 0)} 則訊息，"
+            f"thinking_mode={request_payload.get('thinking_mode')}，"
+            f"tools={len(request_payload.get('tools') or [])} 項"
+        ),
+    )
+
     for attempt in range(max_attempts):
+        if attempt > 0:
+            yield "step", make_step_event(
+                "llm_tool_calls",
+                status="running",
+                delta=f"\n\n— 第 {attempt + 1}/{max_attempts} 次嘗試重新產生 tool_calls —\n",
+                meta={"retry_count": attempt},
+            )
+
         thinking_parts: List[str] = []
         response_parts: List[str] = []
         tool_calls = []
+        thinking_open = False
+        response_open = False
 
         for event, data in LLM.stream_answer(request_payload):
             if event == "thought_chunk":
                 thinking_parts.append(data or "")
-                yield event, data
+                if data:
+                    # 步驟⑥：深度思考（Thinking Mode），逐 token 真即時串流。
+                    yield "step", make_step_event("llm_thinking_r1", status="running", delta=data)
+                    thinking_open = True
             elif event == "response_chunk":
                 response_parts.append(data or "")
-                yield event, data
+                if data:
+                    # 步驟⑦A（暫定）：直接返回最終回答，逐 token 真即時串流；
+                    # 若稍後判定為 TOOL_CALL，這段文字會被收尾標記為
+                    # skipped（見下方），因為它其實是工具呼叫前的暫存提示語
+                    # （LLMReasoning.md §3.3），不是最終回覆。
+                    yield "step", make_step_event(
+                        "llm_final_answer_direct", status="running", delta=data, branch="final_direct"
+                    )
+                    response_open = True
             elif event == "tool_calls":
                 tool_calls = data or []
             elif event == "end":
@@ -232,6 +272,8 @@ def process(session_id: str, request_payload: Dict[str, Any]) -> Iterator[Event]
 
         reason_content = "".join(thinking_parts)
         content = "".join(response_parts)
+        if thinking_open:
+            yield "step", make_step_event("llm_thinking_r1", status="success", delta="")
         _log_reasoning_token_usage(reason_content)
 
         action = decide_action(tool_calls)
@@ -240,28 +282,59 @@ def process(session_id: str, request_payload: Dict[str, Any]) -> Iterator[Event]
             # §4「無需呼叫工具」分支①②③：content 即最終回覆，寫回歷史，
             # 由呼叫端（Harness）透過 Frontend 回傳給使用者。重試迴圈中途
             # 模型改變主意、不再需要工具了，一樣視為正常結束，不算重試失敗。
+            yield "step", make_step_event(
+                "llm_final_answer_direct",
+                status="success",
+                delta="" if response_open else content,
+                branch="final_direct",
+            )
             Harness.append_assistant_message(session_id, content)
-            yield ("end", None)
+            # 步驟⑧A：輸出最終回覆（短路徑到此結束）。
+            yield "step", make_step_event(
+                "deliver_final_answer", status="success", delta="已完成，回覆已送出。"
+            )
+            yield "end", None
             return
 
-        # Action.TOOL_CALL：先做 §5 結構檢查，此檢查失敗代表模型連 JSON 都
-        # 吐不出來，不屬於 ToolCalling.md §6「白名單/型態錯誤」的重試範圍，
-        # 不重試，直接回錯誤提示。
+        # Action.TOOL_CALL：先收尾步驟⑦A的暫存提示語（若有），再開步驟⑦B。
+        if response_open:
+            yield "step", make_step_event(
+                "llm_final_answer_direct",
+                status="skipped",
+                delta="",
+                branch="final_direct",
+                meta={"note": "此段文字為工具呼叫前的暫存提示語，最終回覆將由第二輪推理重新生成。"},
+            )
+
+        # 步驟⑦B：返回工具調用指令。依 §8 不遮蔽，完整顯示 tool_calls JSON。
+        yield "step", make_step_event(
+            "llm_tool_calls",
+            status="success",
+            delta=json.dumps(tool_calls, ensure_ascii=False, indent=2),
+            branch="tool_call",
+        )
+
+        # 先做 §5 結構檢查，此檢查失敗代表模型連 JSON 都吐不出來，不屬於
+        # ToolCalling.md §6「白名單/型態錯誤」的重試範圍，不重試，直接回
+        # 錯誤提示。
         try:
             validate_tool_calls(tool_calls)
         except ToolCallFormatError as exc:
             logger.error("ToolCallFormatError: %s", exc)
             error_notice = "⚠️ 工具呼叫指令格式有誤，暫時無法處理，請重新描述您的問題。"
             Harness.append_assistant_message(session_id, error_notice)
-            yield ("response_chunk", error_notice)
-            yield ("end", None)
+            yield "step", make_step_event("llm_tool_calls", status="error", delta=f"\n{exc}")
+            yield "step", make_step_event(
+                "llm_final_answer_direct", status="error", delta=error_notice, branch="final_direct"
+            )
+            yield "end", None
             return
 
         # ToolCalling.md §6：白名單/必填參數/型態檢查。
         try:
             Tool.validate_against_catalog(tool_calls)
             catalog_error = None
-            break  # 通過驗證，跳出重試迴圈，往下走「暫存 + 降級回覆」。
+            break  # 通過驗證，跳出重試迴圈，往下走「暫存 + 交付工具管道」。
         except Tool.ToolError as exc:
             catalog_error = exc
             if attempt >= max_attempts - 1:
@@ -271,6 +344,12 @@ def process(session_id: str, request_payload: Dict[str, Any]) -> Iterator[Event]
                 attempt + 1,
                 max_attempts,
                 exc,
+            )
+            yield "step", make_step_event(
+                "llm_tool_calls",
+                status="error",
+                delta=f"\n驗證失敗：{exc}\n將要求模型重新生成 tool_calls…",
+                meta={"retry_count": attempt},
             )
             request_payload = _append_retry_notice(request_payload, exc)
             continue
@@ -283,36 +362,76 @@ def process(session_id: str, request_payload: Dict[str, Any]) -> Iterator[Event]
         )
         error_notice = "⚠️ 工具呼叫指令內容有誤，暫時無法處理，請重新描述您的問題。"
         Harness.append_assistant_message(session_id, error_notice)
-        yield ("response_chunk", error_notice)
-        yield ("end", None)
+        yield "step", make_step_event(
+            "llm_tool_calls",
+            status="error",
+            delta=f"\n重試 {Tool.RETRY_MAX} 次後仍失敗：{catalog_error}",
+        )
+        yield "step", make_step_event(
+            "llm_final_answer_direct", status="error", delta=error_notice, branch="final_direct"
+        )
+        yield "end", None
         return
 
     # §4「需呼叫工具」分支①②：驗證通過，暫存推理草稿與工具呼叫，供
     # resume_with_tool_result() 做第二輪推理時讀取 original_draft。
     _stash_pending_reasoning(session_id, reason_content, tool_calls)
 
-    # §4「需呼叫工具」分支①：交付工具執行管道逐一執行。
-    # TODO: Guardrails 步驟⑨（權限/敏感詞審查、必要時的使用者授權確認）
-    # 尚未實作（Guardrails/ 仍是空套件），這裡暫時跳過，直接交付執行；
-    # Guardrails/ 完工後應在下面這個迴圈之前插入審查。
+    # 步驟⑧B：交付工具調用請求。
+    tool_names = [c.get("function", {}).get("name", "?") for c in tool_calls]
+    yield "step", make_step_event(
+        "dispatch_tool_pipeline",
+        status="success",
+        delta=f"交付 {len(tool_calls)} 個工具呼叫：{'、'.join(tool_names)}",
+        meta={"tool_names": tool_names},
+    )
+
+    # 步驟⑨：Guardrails 前置鉤子（權限/敏感詞審查）。目前為 stub，恆放行，
+    # 但仍即時發射步驟⑨的事件，讓思考區序列保持完整（見 Guardrails/precheck.py）。
+    for event, data in Guardrails.precheck(tool_calls):
+        if event == "step":
+            yield "step", data
+        # "result"（是否放行）目前不分支處理——Guardrails 尚未實作真正的
+        # 攔截邏輯，恆為放行；待該套件補上攔截邏輯後，這裡應在收到 False
+        # 時中止本輪工具呼叫，比照 Architect.md「不調用任何工具，直接回覆
+        # 拒絕訊息」分支處理。
+
+    # 步驟⑩～⑬：逐一交付工具執行管道（Backend.execute_tool()，真即時串流，
+    # 見 Backend/pipeline.py）。
     tool_results: List[Backend.FinalToolResult] = []
     for index, call in enumerate(tool_calls):
         request = _build_tool_execution_request(call, index)
         try:
-            tool_results.append(Backend.execute_tool(request))
+            final_result: Optional[Backend.FinalToolResult] = None
+            for event, data in Backend.execute_tool(request):
+                if event == "step":
+                    yield "step", data
+                elif event == "result":
+                    final_result = data
+            if final_result is not None:
+                tool_results.append(final_result)
         except PermissionError as exc:
             # Backend/pipeline.py 對本地執行權限不足刻意不攔截、原樣往外拋，
             # 讓呼叫端能區分「工具本身執行失敗」與「需要重新授權才能繼續」
             # （見 Backend.execute_tool() 文件字串）。Guardrails/ 的使用者
             # 授權流程尚未實作，這裡先把它也當成一次失敗的工具結果處理，
             # 而不是讓整個請求中斷——讓第二輪推理仍有機會誠實告知使用者
-            # 「這部分資訊無法取得」，而不是整輪對話無聲失敗。
+            # 「這部分資訊無法取得」，而不是整輪對話無聲失敗。補發步驟⑩～⑬
+            # 的錯誤狀態事件，確保錯誤也走完整的四格顯示（顯示原則 5）。
             logger.warning("工具「%s」執行遭拒（PermissionError）：%s", request.tool_name, exc)
+            denial_message = f"抱歉，執行「{request.tool_name}」需要額外授權，暫時無法提供此部分資訊。"
+            for step_key in ("tool_execute", "tool_raw_result", "tool_post_process", "tool_result_ready"):
+                yield "step", make_step_event(
+                    step_key,
+                    status="error",
+                    delta=denial_message,
+                    meta={"tool_call_id": request.tool_call_id, "error_code": "PERMISSION_DENIED"},
+                )
             tool_results.append(
                 Backend.FinalToolResult(
                     tool_call_id=request.tool_call_id,
                     is_success=False,
-                    content=f"抱歉，執行「{request.tool_name}」需要額外授權，暫時無法提供此部分資訊。",
+                    content=denial_message,
                     metadata={"error_code": "PERMISSION_DENIED"},
                 )
             )
@@ -340,7 +459,8 @@ def resume_with_tool_result(
     四個子步驟（§3.1–3.4 上下文重組、資料清理與特徵萃取、邏輯校準、NLG
     編排）委派給 LLMReasoning/agent_loop.py 的純函式；本函式只負責跟
     process() 一樣的「呼叫 LLM、累積串流片段」骨架，以及寫回 Session、
-    清空 pending 狀態這些有副作用的收尾動作。
+    清空 pending 狀態這些有副作用的收尾動作，並即時發射步驟⑭⑮⑯⑰的
+    StepEvent。
 
     Args:
         session_id: 本輪對話的 Session ID，需帶有 process() 暫存的
@@ -358,15 +478,11 @@ def resume_with_tool_result(
             最後一則 role="user" 訊息，可能包含重試修正提示。
 
     Yields:
-        跟 process() 相同的事件格式，額外多一個
-        ("metadata", agent_loop.SecondRoundResult) 事件，在 "end" 之前送出
-        （Frontend/app.py 目前的 if/elif 迴圈沒有 else 分支，會安全地忽略
-        未知事件，不需要為此修改 Frontend；日後要做「信心分數 < 0.6 顯示
-        免責聲明」的 UI 時，由這個事件取得 confidence_score）：
-            ("thought_chunk",  <思考內容片段>)
-            ("response_chunk", <最終回覆片段>)
-            ("metadata",       <SecondRoundResult>)
-            ("end",             None)
+        ("step", Trace.StepEvent) — 步驟⑭⑮⑯⑰的即時進度事件；步驟⑰的
+            StepEvent.meta 帶有 confidence_score／cited_sources／
+            reasoning_summary／needs_disclaimer（取代舊版獨立的 "metadata"
+            事件）。
+        ("end", None) — 本輪對話結束。
     """
     t0 = time.perf_counter()
 
@@ -390,13 +506,27 @@ def resume_with_tool_result(
         "messages": [*request_payload.get("messages", []), {"role": "user", "content": final_prompt_text}],
     }
 
+    # 步驟⑭：工具結果＋原始思考草稿再次送入模型。
+    yield "step", make_step_event(
+        "send_to_llm_r2",
+        status="success",
+        delta=enhanced_context,
+        meta={"conflict": bool(conflict_note), "stale": stale},
+    )
+
     response_parts: List[str] = []
+    thinking_open = False
     for event, data in LLM.stream_answer(second_round_payload):
         if event == "thought_chunk":
-            yield event, data
+            if data:
+                # 步驟⑮：綜合分析工具返回的信息，逐 token 真即時串流。
+                yield "step", make_step_event("llm_thinking_r2", status="running", delta=data)
+                thinking_open = True
         elif event == "response_chunk":
             response_parts.append(data or "")
-            yield event, data
+            if data:
+                # 步驟⑯：生成最終自然語言回覆，逐 token 真即時串流。
+                yield "step", make_step_event("llm_final_answer_r2", status="running", delta=data)
         elif event == "tool_calls":
             # AgentLoop 是工具呼叫後的「最終」綜合階段，規格未定義在此
             # 遞迴再次呼叫工具；記錄下來但不處理，避免無限流轉。
@@ -404,12 +534,17 @@ def resume_with_tool_result(
         elif event == "end":
             break
 
+    if thinking_open:
+        yield "step", make_step_event("llm_thinking_r2", status="success", delta="")
+
     final_answer = "".join(response_parts)
     if not final_answer:
         # §5「工具結果為空」／模型第二輪仍未產出任何內容：輸出引導性回覆，
         # 不得隨意捏造數據。
         final_answer = "目前查詢到的資料不足以完整回答這個問題，建議調整篩選條件或補充更多細節後再試一次。"
-        yield ("response_chunk", final_answer)
+        yield "step", make_step_event("llm_final_answer_r2", status="success", delta=final_answer)
+    else:
+        yield "step", make_step_event("llm_final_answer_r2", status="success", delta="")
 
     # §4 輸出規格：confidence_score／cited_sources／reasoning_summary。
     confidence_score = compute_confidence_score(tool_results, conflict_note)
@@ -438,8 +573,20 @@ def resume_with_tool_result(
     Harness.append_assistant_message(session_id, final_answer)
     _clear_pending_reasoning(session_id)
 
-    yield ("metadata", result)
-    yield ("end", None)
+    # 步驟⑰：輸出最終答案（結束）。confidence_score／cited_sources／
+    # reasoning_summary 併入本步驟的 meta，取代舊版獨立的 "metadata" 事件。
+    yield "step", make_step_event(
+        "deliver_final_answer_r2",
+        status="success",
+        delta="已完成，回覆已送出。",
+        meta={
+            "confidence_score": result.confidence_score,
+            "cited_sources": result.cited_sources,
+            "reasoning_summary": result.reasoning_summary,
+            "needs_disclaimer": needs_disclaimer(result.confidence_score),
+        },
+    )
+    yield "end", None
 
 
 __all__ = ["process", "resume_with_tool_result"]

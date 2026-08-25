@@ -3,6 +3,10 @@
 Frontend/app.py
 ----------------
 左右雙欄 AI 對話網站 (Gradio 實作，後端串接 LLMReasoning/ 模組呼叫本機 Ollama)
+
+Architect/ThoughtPanelStep.md §6.1、§7：思考區改為「步驟化即時串流」呈現，
+依 Architect/Architect.md 循序圖①～⑰逐步顯示 Harness／LLMReasoning 發射的
+Trace.StepEvent，取代舊版把 thought_chunk 累加成單一長文字的做法。
 """
 
 import html
@@ -19,6 +23,7 @@ if _PROJECT_ROOT not in sys.path:
 
 import Harness
 import LLMReasoning
+from Trace.step_events import MIRRORS_TO_CHAT, circled_step_no, make_step_event
 
 
 # ----------------------------------------------------------------------------
@@ -238,6 +243,65 @@ body {
 }
 
 /* ================================================================
+   思考區：步驟化區塊樣式（Architect/ThoughtPanelStep.md §7）
+   ================================================================ */
+.thought-step {
+    margin-bottom: 4px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border-color-primary);
+    background: var(--background-fill-primary);
+}
+
+.thought-step-title {
+    font-weight: 700;
+    margin-bottom: 4px;
+}
+
+.thought-step-body {
+    white-space: normal;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    color: var(--body-text-color);
+}
+
+.thought-cursor {
+    display: inline-block;
+    animation: thought-blink 1s steps(1) infinite;
+}
+
+@keyframes thought-blink {
+    50% { opacity: 0; }
+}
+
+.thought-step-running {
+    border-color: var(--primary-500);
+}
+
+.thought-step-error {
+    border-color: #e05252;
+    background: rgba(224, 82, 82, 0.08);
+}
+
+.thought-step-skipped {
+    opacity: 0.6;
+}
+
+.thought-step-divider {
+    text-align: center;
+    color: var(--body-text-color-subdued);
+    font-size: 12px;
+    margin: 2px 0 8px;
+}
+
+.thought-complete {
+    text-align: center;
+    font-weight: 700;
+    color: var(--body-text-color-subdued);
+    padding: 10px 0 4px;
+}
+
+/* ================================================================
    輸入區：固定在左欄底部，不改變左欄寬度
    ================================================================ */
 .input-group {
@@ -377,14 +441,78 @@ body {
 HEAD_JS = ""
 
 # ----------------------------------------------------------------------------
-# Helper
+# Helper：思考區步驟化渲染（Architect/ThoughtPanelStep.md §6.1、§7）
 # ----------------------------------------------------------------------------
-def render_thought_html(thought_text: str) -> str:
-    if not thought_text:
+# 同一 step_no 收到多次 StepEvent 時，前端把每次的 delta 疊加成完整內容，
+# 而不是只顯示最後一次的增量——這裡用一個以 step_no 為鍵的 dict（Python
+# 3.7+ 字典保序，天然符合「依 step_no 遞增顯示」的需求）累積每一格的畫面
+# 狀態，跟 Trace.StepEvent 本身（只帶「這一次的增量」）分開。
+_MULTI_CALL_STEPS = {10, 11, 12, 13}  # 步驟⑩～⑬：同輪多個工具呼叫時會重複出現。
+
+
+def _apply_step_event(step_views: dict, event) -> None:
+    """把一個 Trace.StepEvent 疊加進 step_views（key=step_no）。"""
+    view = step_views.get(event.step_no)
+    if view is None:
+        view = {"step_no": event.step_no, "content": "", "meta": {}, "_last_tool_call_id": None}
+        step_views[event.step_no] = view
+
+    view["step_key"] = event.step_key
+    view["title"] = event.title
+    view["status"] = event.status
+
+    delta = event.delta or ""
+    if delta:
+        tool_call_id = (event.meta or {}).get("tool_call_id")
+        # 步驟⑩～⑬同輪呼叫多個工具時共用同一格，用分隔線標示不同的
+        # tool_call_id，避免多個工具的內容混在一起分不清楚（見
+        # Architect/ThoughtPanelStep.md §5：「⑨～⑬會依工具數量重複出現…
+        # 前端渲染時以子區塊列出，仍計為一組⑨～⑬」）。
+        if (
+            event.step_no in _MULTI_CALL_STEPS
+            and tool_call_id
+            and tool_call_id != view["_last_tool_call_id"]
+        ):
+            delta = (f"\n\n── {tool_call_id} ──\n{delta}" if view["content"] else f"── {tool_call_id} ──\n{delta}")
+            view["_last_tool_call_id"] = tool_call_id
+        view["content"] += delta
+
+    if event.meta:
+        view["meta"] = event.meta
+
+
+_STATUS_PREFIX = {"error": "⚠️ ", "skipped": "⏭️ "}
+
+
+def render_thought_html(step_views: dict = None, stream_ended: bool = False) -> str:
+    """
+    依 step_no 由小到大渲染每個步驟區塊，格式對齊
+    Architect/ThoughtPanelStep.md 範例：①標題 / 內容 / ▼。
+    """
+    if not step_views:
         inner = '<span class="thought-empty">等待思考過程…</span>'
-    else:
-        inner = html.escape(thought_text).replace("\n", "<br>")
-    return f'<div class="thought-scroll-inner">{inner}</div>'
+        return f'<div class="thought-scroll-inner">{inner}</div>'
+
+    blocks = []
+    for step_no in sorted(step_views.keys()):
+        view = step_views[step_no]
+        status = view.get("status", "running")
+        status_class = f"thought-step thought-step-{status}"
+        prefix = _STATUS_PREFIX.get(status, "")
+        title = html.escape(f"{circled_step_no(step_no)} {prefix}{view.get('title', '')}")
+        body = html.escape(view.get("content", "")).replace("\n", "<br>")
+        cursor = '<span class="thought-cursor">▍</span>' if status == "running" else ""
+        blocks.append(
+            f'<div class="{status_class}">'
+            f'<div class="thought-step-title">{title}</div>'
+            f'<div class="thought-step-body">{body}{cursor}</div>'
+            f"</div>"
+            '<div class="thought-step-divider">▼</div>'
+        )
+    if stream_ended:
+        blocks.append('<div class="thought-complete">【思考流程完成】</div>')
+    return '<div class="thought-scroll-inner">' + "".join(blocks) + "</div>"
+
 
 def _extract_text(content) -> str:
     if isinstance(content, str): return content
@@ -410,9 +538,9 @@ EXAMPLE_QUESTIONS = [
 def user_submit(user_message, history):
     user_message = (user_message or "").strip()
     if not user_message:
-        return history, "", render_thought_html("")
+        return history, "", render_thought_html()
     history = history + [{"role": "user", "content": user_message}]
-    return history, "", render_thought_html("")
+    return history, "", render_thought_html()
 
 def disable_inputs():
     """同時停用輸入框與發送按鈕"""
@@ -421,21 +549,54 @@ def disable_inputs():
 def bot_response(history, session_id):
     if not history or history[-1]["role"] != "user":
         # 如果無效，立刻重新啟用輸入元件
-        yield history, render_thought_html(""), gr.update(interactive=True), gr.update(interactive=True), session_id
+        yield history, render_thought_html(), gr.update(interactive=True), gr.update(interactive=True), session_id
         return
 
     user_message = _extract_text(history[-1]["content"])
+    # step_views：本輪思考區的步驟狀態（key=step_no），只在這次 bot_response()
+    # 呼叫的生命週期內存在，不需要額外的 gr.State（跟舊版 thought_acc／
+    # response_acc 區域變數同樣的做法）。
+    step_views: dict = {}
 
-    # ---- Harness 步驟 1-6：前處理 + Session 管理 + 請求載荷組裝 ----
+    def _current_html(ended: bool = False) -> str:
+        return render_thought_html(step_views, stream_ended=ended)
+
+    # 步驟①：輸入提問＋上下文（前端本來就知道使用者問了什麼，不需要等後端）。
+    _apply_step_event(
+        step_views,
+        make_step_event("receive_input", status="success", delta=user_message),
+    )
+    yield history, _current_html(), gr.update(interactive=False), gr.update(interactive=False), session_id
+
+    # ---- Harness 步驟②～④：Session 管理、前處理、System Prompt 拉取 ----
+    request_payload = None
     try:
-        session_id, request_payload = Harness.handle_turn(user_message, session_id=session_id)
+        for event, data in Harness.handle_turn(user_message, session_id=session_id):
+            if event == "step":
+                _apply_step_event(step_views, data)
+                yield history, _current_html(), gr.update(interactive=False), gr.update(interactive=False), session_id
+            elif event == "result":
+                session_id, request_payload = data
     except Harness.HarnessError as exc:
-        # EMPTY_CONTENT / INVALID_SESSION：拒絕本次請求，於對話中顯示錯誤訊息。
-        # INVALID_SESSION 額外把 session_id 重置為 None，讓下一輪重新建立會話。
+        # EMPTY_CONTENT / INVALID_SESSION：拒絕本次請求，於對話中顯示錯誤訊息，
+        # 並在思考區步驟②標示錯誤狀態（顯示原則 5：錯誤也需呈現）。
         if exc.code == "INVALID_SESSION":
             session_id = None
+        _apply_step_event(
+            step_views,
+            make_step_event("build_request", status="error", delta=exc.user_message),
+        )
         history = history + [{"role": "assistant", "content": f"⚠️ {exc.user_message}"}]
-        yield history, render_thought_html(""), gr.update(interactive=True), gr.update(interactive=True), session_id
+        yield history, _current_html(True), gr.update(interactive=True), gr.update(interactive=True), session_id
+        return
+
+    if request_payload is None:
+        # 理論上不會發生：Harness.handle_turn() 沒有拋例外就一定會 yield
+        # 一次 "result"；這裡是防呆，避免 request_payload 是 None 時繼續
+        # 往下呼叫 LLMReasoning.process() 而整個崩潰。
+        logger_message = "Harness.handle_turn() 未回傳 result，已中止本輪對話。"
+        history = history + [{"role": "assistant", "content": f"⚠️ {logger_message}"}]
+        yield history, _current_html(True), gr.update(interactive=True), gr.update(interactive=True), session_id
         return
 
     # 把 Harness 組好的完整 payload（系統提示詞 + 歷史對話 + 這句清理過的
@@ -446,24 +607,16 @@ def bot_response(history, session_id):
     # Harness.append_assistant_message。
     history = history + [{"role": "assistant", "content": ""}]
 
-    thought_acc = ""
-    response_acc = ""
-
     for event, data in LLMReasoning.process(session_id, request_payload):
-        if event == "thought_chunk":
-            thought_acc += data
-            # 串流中保持停用狀態
-            yield history, render_thought_html(thought_acc), gr.update(interactive=False), gr.update(interactive=False), session_id
-
-        elif event == "response_chunk":
-            response_acc += data
-            history[-1]["content"] = response_acc
-            yield history, render_thought_html(thought_acc), gr.update(interactive=False), gr.update(interactive=False), session_id
-
+        if event == "step":
+            _apply_step_event(step_views, data)
+            if data.step_key in MIRRORS_TO_CHAT:
+                # 步驟⑦A／⑯：這兩步的內容除了思考區，也同步進左側聊天氣泡
+                # （取代舊版 response_chunk 事件的用途）。
+                history[-1]["content"] += data.delta or ""
+            yield history, _current_html(), gr.update(interactive=False), gr.update(interactive=False), session_id
         elif event == "end":
-            history[-1]["content"] = response_acc
-            # 串流結束，重新啟用輸入框與發送按鈕
-            yield history, render_thought_html(thought_acc), gr.update(interactive=True), gr.update(interactive=True), session_id
+            yield history, _current_html(True), gr.update(interactive=True), gr.update(interactive=True), session_id
 
 def on_like(data: gr.LikeData):
     feedback = "讚" if data.liked else "踩"
@@ -523,7 +676,7 @@ def build_demo() -> gr.Blocks:
                 # ---------------- 右側：固定 1/3 寬度 ----------------
                 with gr.Column(elem_id="right_panel", scale=1, min_width=0):
                     thought_html = gr.HTML(
-                        value=render_thought_html(""),
+                        value=render_thought_html(),
                         elem_id="thought_panel",
                         # 鎖死高度 = 一律填滿 #thought_panel（見 CUSTOM_CSS），
                         # 內容變長時交給 Gradio 自己的 overflow-y:auto 捲動；
