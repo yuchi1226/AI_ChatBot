@@ -140,6 +140,41 @@
 
 ---
 
+**一、相同問題是否需要每次重新搜尋**
+
+目前答案是「會」。`Backend/websearch/client.py` 的 `search()` 每次都直接呼叫 `ddgs.text()`，`Backend/adapters/http_request.py` 也是每次都用 `httpx.request()` 現打，兩者都沒有任何結果儲存層——同一個 session 裡問兩次一樣的問題，或不同 session 問同一個問題，都會重新打一次 DuckDuckGo／目標網站。
+
+不需要每次都重搜。建議加一層「查詢層快取」，做法上跟你現有風格一致（`Backend/websearch/config.py` + `client.py` 的分離模式）：
+
+- key 用正規化過的 `(query, region, time_range)`，同一個問題不同大小寫/前後空白要視為同一筆。
+- TTL 而非永久快取，因為網路內容會變；先用單一環境變數（如 `WEBSEARCH_CACHE_TTL_SECONDS`）起步，不用一開始就分「新聞類短 TTL、事實類長 TTL」，符合 `AGENTS.md`「選最簡單、完全滿足目前需求的實作」。
+- 儲存位置：比照 `Harness/session.py` 的 `SessionStore`（行程內記憶體 dict + lock）即可起步；如果要跨重啟保留（例如常見問題重啟後也不用重搜），比照 `Backend/rag/vector_store.py` 用 Qdrant embedded 磁碟模式的邏輯，改用 stdlib 的 sqlite 落地，不用引入 Redis——你的部署本來就是單一 Gradio 行程，沒有多實例同步的需求。
+
+**二、同一個網站的同一份內容能否用結果識別避免重複查詢**
+
+這其實是兩層不同的快取，值得分開看：
+
+第一層是上面講的「查詢快取」——避免同一個 query 重打。第二層是「內容層快取」，針對 `http_request` 這種直接打 URL 的工具（模型可能先 `web_search` 拿到連結，再用 `http_request` 抓全文），現在完全沒有：
+
+- 條件式請求：對支援的網站存 `ETag`／`Last-Modified`，下次帶 `If-None-Match`／`If-Modified-Since`，對方回 304 就不用重傳內容——省頻寬，但仍要打一次網路。
+- 內容雜湊：對回應內容算 sha256，存 `{url: (hash, content, fetched_at)}`。TTL 內直接命中快取、連網路都不用打；就算 TTL 過了要重抓，雜湊沒變也能讓下游（例如要不要重新丟給 LLM、要不要重新 embedding）知道「內容其實沒變」。
+- 跨 URL 去重：不同網址內容相同（轉載新聞、AMP 版本、鏡像站）時，用內容雜湊而非 URL 當識別鍵，可以避免同一份內容被當成好幾筆不同資料餵給模型，浪費 context。
+
+這層邏輯可以放在一個共用的 `Backend/http_cache.py`，讓 `http_request` adapter 和未來如果要做「抓網頁全文」的功能共用，介面上不用動 `Backend/adapters/http_request.py` 對外的呼叫方式。
+
+**三、本地資料量過大時的篩選／摘要／分層／檢索**
+
+你其實已經有「檢索」這一層了：`Backend/rag/ingest.py` 固定字元切塊（500/50）+ `Backend/rag/vector_store.py` 向量 top-k 檢索，這就是標準 RAG 做法。但有幾個現成的旋鈕沒轉，加上幾個還沒做的層次：
+
+- 篩選：`RAG_SCORE_THRESHOLD` 預設是 `0.0`（不過濾），代表知識庫變大之後，低相關的雜訊 chunk 一樣會被塞進 LLM 的 context，浪費 token 又可能誤導答案。這是最便宜的第一步——先把門檻調到一個非零值。另外 Qdrant 支援 payload filter（依 `metadata["source"]`、日期等先篩再算相似度），資料量大了之後比單純調高 `top_k` 更省。
+- 摘要：現在 `Architect/ToolExecution.md` §「內容截斷」是頭尾截斷（`...資料過長已縮減`），`file_read` 對超長檔案是回傳前 100 行——這兩個都是「砍掉中間」而非「摘要」，資訊會遺失。既然你已經有 Agent Loop 的第二輪推理（`LLMReasoning/agent_loop.py`），可以在超過某個長度門檻時，讓那一輪順便做摘要而不是單純截斷，但這要多一次本地 Ollama 呼叫，等於用延遲換品質，建議只在明顯超長時才觸發，不要每次都做。
+- 分層：兩段式檢索是常見做法——先用較大的 `top_k` 做便宜的粗篩，再做一次精篩（rerank 或直接讓 LLM 自己判斷相關性，你的 agent loop 已經有「矛盾偵測」「時效性檢查」的雛形，某種程度上已經在做這件事）。如果知識庫繼續長大，也可以考慮把常用/新資料放進一個較小的「熱」collection 先查，查不到才 fallback 到完整 collection，減少每次查詢都要掃全部向量的成本。
+- 檢索/建置面的去重：`ingest_document()` 目前沒有防止同一份內容被重複 ingest 兩次（例如使用者上傳同一份文件兩次，或不同來源其實是同一段文字）。可以在切塊後、embedding 前先算內容雜湊，Qdrant 裡已存在同雜湊就跳過——同時省了 embedding 呼叫（本地 Ollama 算 embedding 也是要吃運算資源的）和儲存空間。
+- 這個「資料太大」的問題其實也發生在對話歷史上：`Harness/session.py` 的壓縮策略是「超過 `MAX_HISTORY_MESSAGES` 則數就砍最舊的」，是很粗的分層（按則數而非按 token 預算，砍掉的內容也是直接消失、沒有摘要保留）。之後如果對話變長、User 抱怨「AI 忘記前面說過的」，這裡會是下一個要處理的點。
+
+**優先順序建議**：照 `AGENTS.md`「先做最小可行、逐層長」的原則，我會先做這三件事再看效果：(1) 把 `RAG_SCORE_THRESHOLD` 開起來、(2) 幫 `web_search`／`http_request` 加一個簡單的 TTL 記憶體快取、(3) ingest 時加內容雜湊去重。語意快取（用 embedding 判斷「問法不同但意思相同」算命中）、cross-encoder rerank、多層 collection 這些，等你實際觀察到成本/延遲痛點再做，現在做屬於投機性抽象。
+
+---
 ## 附註：以下規格條文經確認「已完整實作」，不列入 TODO
 
 - ①～⑰ 步驟化即時串流思考區（`Trace/`、`Harness/harness.py`、
