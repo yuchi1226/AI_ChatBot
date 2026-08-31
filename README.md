@@ -29,7 +29,7 @@ AI_ChatBot/
 │   ├── adapters/             各工具的執行 adapter（web_search、file_read、code_interpreter…）
 │   ├── rag/                  RAG 子系統：BGE-M3 embedding + Qdrant 向量檢索
 │   └── websearch/            DuckDuckGo 網路搜尋（ddgs）
-├── Guardrails/           安全守衛 pre-execution hook（目前為 stub，一律放行）
+├── Guardrails/           安全守衛 pre-execution hook（規則式審查 + LLM 二次複核）
 └── Trace/                思考區步驟事件（StepEvent）共用資料結構
 ```
 
@@ -105,5 +105,5 @@ python main.py
 
 ## 現況與已知限制
 
-- **Guardrails 尚未實作**：`Guardrails/precheck.py` 目前一律放行工具呼叫，真正的權限／敏感詞審查邏輯尚待開發。
+- **Guardrails 使用者授權子流程尚未實作**：`Guardrails/precheck.py` 已具備規則式（關鍵字/正則）敏感詞與權限審查，並在規則放行後加上 LLM 二次複核（本機 Ollama，逾時/失敗時優雅降級為維持規則式結論），攔截粒度為單一 `tool_call`。但「⚠️ 請求批准／✅ 確認」使用者授權子流程仍是 stub，尚未實作。
 - **RAG 知識庫建置**：`Backend/rag/ingest.py` 提供切塊與寫入 Qdrant 的功能，但目前尚無專屬的匯入介面／CLI，需自行呼叫。

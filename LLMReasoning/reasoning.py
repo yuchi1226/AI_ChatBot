@@ -386,21 +386,55 @@ def process(session_id: str, request_payload: Dict[str, Any]) -> Iterator[Event]
         meta={"tool_names": tool_names},
     )
 
-    # 步驟⑨：Guardrails 前置鉤子（權限/敏感詞審查）。目前為 stub，恆放行，
-    # 但仍即時發射步驟⑨的事件，讓思考區序列保持完整（見 Guardrails/precheck.py）。
-    for event, data in Guardrails.precheck(tool_calls):
+    # 步驟⑨：Guardrails 前置鉤子（權限/敏感詞審查）。逐一審查每個
+    # tool_call：先跑規則式檢查，放行的才進 LLM 二次複核（見
+    # Guardrails/precheck.py）。攔截粒度是單一 tool_call，被擋下的在下面
+    # ⑩～⑬迴圈中直接合成拒絕結果，不呼叫 Backend.execute_tool，其餘沒被
+    # 擋下的工具呼叫照常執行。
+    guardrails_blocked: Dict[int, Guardrails.RejectionReason] = {}
+    for event, data in Guardrails.precheck(tool_calls, reason_content):
         if event == "step":
             yield "step", data
-        # "result"（是否放行）目前不分支處理——Guardrails 尚未實作真正的
-        # 攔截邏輯，恆為放行；待該套件補上攔截邏輯後，這裡應在收到 False
-        # 時中止本輪工具呼叫，比照 Architect.md「不調用任何工具，直接回覆
-        # 拒絕訊息」分支處理。
+        elif event == "result":
+            guardrails_blocked = data["blocked"]
 
     # 步驟⑩～⑬：逐一交付工具執行管道（Backend.execute_tool()，真即時串流，
     # 見 Backend/pipeline.py）。
     tool_results: List[Backend.FinalToolResult] = []
     for index, call in enumerate(tool_calls):
         request = _build_tool_execution_request(call, index)
+
+        if index in guardrails_blocked:
+            # 步驟⑨攔截：比照下方 PermissionError 分支的處理方式——合成一筆
+            # 失敗的 FinalToolResult，補發⑩～⑬的錯誤狀態事件（顯示原則 5：
+            # 錯誤也要走完整四格顯示），不呼叫 Backend.execute_tool，讓第二輪
+            # 推理仍有機會誠實告知使用者這部分被拒絕，而不是整輪對話無聲
+            # 失敗，也不會因為一個工具被擋就連帶中止其餘工具呼叫。
+            rejection = guardrails_blocked[index]
+            logger.warning(
+                "工具「%s」遭 Guardrails 步驟⑨攔截：%s", request.tool_name, rejection.internal_detail
+            )
+            for step_key in ("tool_execute", "tool_raw_result", "tool_post_process", "tool_result_ready"):
+                yield "step", make_step_event(
+                    step_key,
+                    status="error",
+                    delta=rejection.public_message,
+                    meta={
+                        "tool_call_id": request.tool_call_id,
+                        "error_code": "GUARDRAILS_BLOCKED",
+                        "category": rejection.category,
+                    },
+                )
+            tool_results.append(
+                Backend.FinalToolResult(
+                    tool_call_id=request.tool_call_id,
+                    is_success=False,
+                    content=rejection.public_message,
+                    metadata={"error_code": "GUARDRAILS_BLOCKED", "category": rejection.category},
+                )
+            )
+            continue
+
         try:
             final_result: Optional[Backend.FinalToolResult] = None
             for event, data in Backend.execute_tool(request):

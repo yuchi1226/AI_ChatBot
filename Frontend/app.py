@@ -448,7 +448,10 @@ HEAD_JS = ""
 # 而不是只顯示最後一次的增量——這裡用一個以 step_no 為鍵的 dict（Python
 # 3.7+ 字典保序，天然符合「依 step_no 遞增顯示」的需求）累積每一格的畫面
 # 狀態，跟 Trace.StepEvent 本身（只帶「這一次的增量」）分開。
-_MULTI_CALL_STEPS = {10, 11, 12, 13}  # 步驟⑩～⑬：同輪多個工具呼叫時會重複出現。
+_MULTI_CALL_STEPS = {9, 10, 11, 12, 13}  # 步驟⑨～⑬：同輪多個工具呼叫時會重複出現，
+# 用 tool_call_id 分隔不同工具的內容，避免混在一起分不清楚（見
+# Guardrails/precheck.py：步驟⑨現在每個 tool_call 會發射多則 StepEvent
+# 呈現完整審查過程，這裡讓多個工具呼叫的過程彼此分開顯示）。
 
 
 def _apply_step_event(step_views: dict, event) -> None:

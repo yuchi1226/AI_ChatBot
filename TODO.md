@@ -35,11 +35,19 @@
   額外顯示免責聲明樣式」。
   影響檔案：`Frontend/app.py`（`render_thought_html`、`_apply_step_event`）。
 
-- [ ] **Guardrails 安全審查尚未實作，一律放行**
-  `Guardrails/precheck.py` 目前恆回傳 `status="skipped"` + `("result", True)`，
-  沒有任何實際的權限／敏感詞審查邏輯，也沒有「攔截後直接回覆拒絕訊息」的分支
-  （`Architect.md` 循序圖「安全紅線優先」那條路徑目前無法真正觸發）。README 已
-  自陳此為已知限制，但仍是循序圖步驟⑨的核心缺口。
+- [✓] **Guardrails 安全審查尚未實作，一律放行**（已修復：`Guardrails/rules.py`
+  新增規則式（關鍵字/正則）審查——敏感詞分類黑名單、`database_query` 寫入型
+  SQL 攔截、`http_request` SSRF 網址攔截、`code_interpreter` 高風險程式碼樣式
+  攔截；`Guardrails/llm_judge.py` 新增規則放行後的 LLM 二次複核，呼叫本機
+  Ollama 抓換句話說/委婉包裝手法，逾時或解析失敗時優雅降級為維持規則式結論；
+  `Guardrails/precheck.py` 改為逐一審查每個 `tool_call`，攔截粒度是單一
+  `tool_call` 而非整輪；`LLMReasoning/reasoning.py` 步驟⑨之後的迴圈改為讀取
+  攔截結果，被攔截的 `tool_call` 比照既有 `PermissionError` 分支合成拒絕結果
+  （不呼叫 `Backend.execute_tool`），其餘照常執行，等同循序圖「不調用任何
+  工具，直接回覆拒絕訊息」的效果。新增 `Tests/test_guardrails_rules.py`／
+  `test_guardrails_llm_judge.py`／`test_guardrails_precheck.py` 涵蓋放行/攔截
+  案例。使用者授權子流程（⚠️請求批准／✅確認）維持 stub，不在此次範圍內，
+  見下一條目。）
 
 - [ ] **使用者授權子流程（⚠️ 請求批准／✅ 確認）完全沒有程式碼路徑**
   `Trace/step_events.py` 已登錄 `step_key="guardrails_user_authorization"`，但
